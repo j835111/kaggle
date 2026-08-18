@@ -1,0 +1,10 @@
+# 訓練環境（Kaggle Notebook / RunPod）才需要。本機沒有 GPU，不要在這裡裝。
+# Kaggle Notebook 映像檔已內建 torch / transformers，通常只需補 peft 與 bitsandbytes。
+-r requirements.txt
+torch>=2.1
+transformers>=4.40
+datasets>=2.18
+accelerate>=0.30
+peft>=0.11
+sentencepiece>=0.2
+bitsandbytes>=0.43

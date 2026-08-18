@@ -1,0 +1,8 @@
+# 本機（CPU）用：資料處理、CV、提交組裝。
+# 訓練相依套件在 requirements-train.txt，只在有 GPU 的環境安裝。
+pandas>=2.0
+numpy>=1.24
+scikit-learn>=1.3
+pyarrow>=14.0
+kaggle>=1.6
+pytest>=8.0

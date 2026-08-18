@@ -1,0 +1,33 @@
+# 競賽資料（很大，且受競賽規則約束，不得散布）
+# 用 **/ 前綴：含斜線的 pattern 錨定在本檔所在目錄，
+# 沒有 ** 的話只會蓋到工作區根目錄，蓋不到 competitions/<slug>/data/。
+**/data/*
+!**/data/.gitkeep
+
+# 產出
+**/outputs/*
+!**/outputs/.gitkeep
+*.csv
+*.parquet
+
+# 模型權重與快取
+*.bin
+*.safetensors
+*.pt
+*.ckpt
+checkpoints/
+wandb/
+.cache/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+*.egg-info/
+
+# 憑證 —— 絕對不要進 git
+kaggle.json
+.env
