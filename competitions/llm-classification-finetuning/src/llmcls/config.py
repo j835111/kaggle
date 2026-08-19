@@ -7,9 +7,15 @@ from pathlib import Path
 
 COMPETITION = "llm-classification-finetuning"
 
-# Kaggle Notebook 內資料會掛在 /kaggle/input/<competition>/；本機則放在 ./data/。
+# Kaggle Notebook 內資料掛載路徑：透過網頁 UI「Add Data」掛的話是
+# /kaggle/input/<competition>/，但實測透過 `kaggle kernels push`（kernel-metadata.json
+# 的 competition_sources）掛的話，實際掛在 /kaggle/input/competitions/<competition>/，
+# 多一層 competitions/ —— 兩條路徑都要認，不要假設只有一種。
 # 可用環境變數 LLMCLS_DATA_DIR 覆寫（例如指到 data/fixture 跑煙霧測試）。
-_KAGGLE_INPUT = Path("/kaggle/input") / COMPETITION
+_KAGGLE_INPUT_CANDIDATES = [
+    Path("/kaggle/input") / COMPETITION,
+    Path("/kaggle/input/competitions") / COMPETITION,
+]
 # 本競賽目錄 competitions/<slug>/，不是 git repo 根目錄 —— 工作區還有其他競賽。
 _COMP_ROOT = Path(__file__).resolve().parents[2]
 
@@ -17,8 +23,9 @@ _COMP_ROOT = Path(__file__).resolve().parents[2]
 def _resolve_data_dir() -> Path:
     if env := os.environ.get("LLMCLS_DATA_DIR"):
         return Path(env)
-    if _KAGGLE_INPUT.exists():
-        return _KAGGLE_INPUT
+    for candidate in _KAGGLE_INPUT_CANDIDATES:
+        if candidate.exists():
+            return candidate
     return _COMP_ROOT / "data"
 
 

@@ -30,7 +30,9 @@
 # %%
 import pathlib
 
-print("/kaggle/input 底下：", sorted(p.name for p in pathlib.Path("/kaggle/input").iterdir()))
+print("/kaggle/input 底下（找 train.csv，最多往下 3 層）：")
+for p in pathlib.Path("/kaggle/input").glob("**/train.csv"):
+    print(" ", p)
 
 from llmcls.config import DATA_DIR
 
