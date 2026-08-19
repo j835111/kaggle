@@ -31,39 +31,58 @@ SRC_DIR = COMP_ROOT / "src" / "llmcls"
 DELIM = "'''"
 
 
-def main() -> int:
+def build_bootstrap_source() -> str:
+    """回傳可以直接貼進 Kaggle Notebook 一個 cell 的完整原始碼字串。
+
+    也被 scripts/build_notebooks.py 呼叫，內嵌進 .ipynb 的第一個 code cell，
+    所以邏輯只寫這一份，CLI 用法（印到 stdout）跟 .ipynb 產生器共用。
+    """
     files = sorted(SRC_DIR.glob("*.py"))
     if not files:
-        print(f"找不到任何檔案：{SRC_DIR}", file=sys.stderr)
-        return 1
+        raise FileNotFoundError(f"找不到任何檔案：{SRC_DIR}")
 
     for f in files:
         content = f.read_text(encoding="utf-8")
         if DELIM in content:
-            print(f"{f} 含有 {DELIM}，無法用這個分隔符內嵌，請改寫 gen_notebook_bootstrap.py", file=sys.stderr)
-            return 1
+            raise ValueError(f"{f} 含有 {DELIM}，無法用這個分隔符內嵌，請改寫 gen_notebook_bootstrap.py")
         if content.endswith("\\"):
-            print(f"{f} 內容以反斜線結尾，raw string 包不住，請改寫 gen_notebook_bootstrap.py", file=sys.stderr)
-            return 1
+            raise ValueError(f"{f} 內容以反斜線結尾，raw string 包不住，請改寫 gen_notebook_bootstrap.py")
 
-    print('"""貼進 Kaggle Notebook 第一個 cell —— 由 scripts/gen_notebook_bootstrap.py 產生，不要手改。"""')
-    print()
-    print("import pathlib")
-    print("import sys")
-    print()
-    print("_llmcls_files = {")
+    lines = [
+        '"""貼進 Kaggle Notebook 第一個 cell —— 由 scripts/gen_notebook_bootstrap.py 產生，不要手改。"""',
+        "",
+        "import pathlib",
+        "import sys",
+        "",
+        "_llmcls_files = {",
+    ]
     for f in files:
         content = f.read_text(encoding="utf-8")
-        print(f"    {f.name!r}: r{DELIM}{content}{DELIM},")
-    print("}")
-    print()
-    print('_pkg_dir = pathlib.Path("/kaggle/working/llmcls_src/llmcls")')
-    print("_pkg_dir.mkdir(parents=True, exist_ok=True)")
-    print("for _name, _content in _llmcls_files.items():")
-    print('    (_pkg_dir / _name).write_text(_content, encoding="utf-8")')
-    print()
-    print('sys.path.insert(0, "/kaggle/working/llmcls_src")')
-    print('print("llmcls bootstrapped:", sorted(p.name for p in _pkg_dir.glob("*.py")))')
+        lines.append(f"    {f.name!r}: r{DELIM}{content}{DELIM},")
+    lines += [
+        "}",
+        "",
+        # 刻意複製本機 <comp_root>/src/llmcls/ 這個層級結構（不是省一層扁平的
+        # <base>/llmcls/），因為 llmcls/config.py 用 Path(__file__).resolve().parents[2]
+        # 往上兩層猜 comp root；層數對不上，DATA_DIR 猜錯路徑的 fallback 分支就會找錯地方
+        # （實測就真的因為這樣 fallback 到 /kaggle/working/data 而找不到 train.csv）。
+        '_pkg_dir = pathlib.Path("/kaggle/working/llmcls_src/src/llmcls")',
+        "_pkg_dir.mkdir(parents=True, exist_ok=True)",
+        "for _name, _content in _llmcls_files.items():",
+        '    (_pkg_dir / _name).write_text(_content, encoding="utf-8")',
+        "",
+        'sys.path.insert(0, "/kaggle/working/llmcls_src/src")',
+        'print("llmcls bootstrapped:", sorted(p.name for p in _pkg_dir.glob("*.py")))',
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def main() -> int:
+    try:
+        print(build_bootstrap_source(), end="")
+    except (FileNotFoundError, ValueError) as e:
+        print(e, file=sys.stderr)
+        return 1
     return 0
 
 

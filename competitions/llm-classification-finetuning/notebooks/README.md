@@ -4,28 +4,67 @@
 `test.csv` 會換成真正的隱藏測試集。所以訓練跟推論拆成兩個 notebook：
 
 - `train_deberta.py` —— 訓練。開網路（下載 base model）+ GPU，練完把權重存到
-  `/kaggle/working/model/`，Save Version 後那個輸出資料夾會變成一個 Kaggle Dataset。
-- `infer_deberta.py` —— 推論。**關網路**，掛上訓練 notebook 存出的模型 Dataset，
-  對（真正的）`test.csv` 跑推論，寫出 `submission.csv`。
+  `/kaggle/working/model/fold0/`。
+- `infer_deberta.py` —— 推論。**關網路**，讀訓練 notebook 存出的權重，對（真正的）
+  `test.csv` 跑推論，寫出 `submission.csv`。
 
-兩個檔案都是 `# %%` cell 分隔的草稿（Jupytext percent format），不是可直接上傳的
-`.ipynb`。用法：在 Kaggle 開一個新 Notebook，把每個 `# %%` 區塊的內容貼成一個 cell
-（或用 `jupytext --to notebook` 在本機先轉成 `.ipynb` 再上傳）。
+這兩個 `.py` 是 `# %%` cell 分隔的草稿（Jupytext percent format），是**編輯用的原始
+檔**，不要直接上傳。實際上傳 Kaggle 的是 `train_kernel/train_deberta.ipynb` 與
+`infer_kernel/infer_deberta.ipynb`，由 `scripts/build_notebooks.py` 從草稿產生。
 
-共用的部分：
+## 用 CLI 直接推上 Kaggle（推薦）
 
-1. **把 `src/llmcls` 送進 Kaggle**：兩份草稿的第一個 code cell 都寫著
-   `>>> 這裡貼 notebooks/_bootstrap_cell.py 的完整內容 <<<`。先在本機執行
-   `python scripts/gen_notebook_bootstrap.py > notebooks/_bootstrap_cell.py`
-   （`src/llmcls/` 有改動就要重新產生一次），再把產生的檔案內容整個貼進那個 cell。
-   執行後會把原始碼直接寫進 `/kaggle/working/llmcls_src/` 並加進 `sys.path`，
-   `import llmcls` 就能用了 —— 不需要另外建 Kaggle Dataset 掛程式碼，這條路徑
-   曾經在「Dataset 有沒有建對 / 掛載名稱對不對」上出過 `ModuleNotFoundError`。
-2. `llmcls.config` 偵測到 `/kaggle/input/` 存在時會自動切換 `DATA_DIR`；`MODEL_DIR`
-   則是用 `LLMCLS_MODEL_DIR` 環境變數指到模型 Dataset 的掛載路徑（掛載名稱由你在
-   Kaggle UI 上決定，沒辦法預先寫死 —— 訓練完在 Kaggle 的 Output 分頁確認實際路徑）。
-3. 提交前一定要跑 `validate_submission()`（`save_submission()` 內部已經會呼叫）；
-   Kaggle 只會回報「格式錯誤」，不會告訴你錯在哪一列。
+```bash
+# 每次改了 notebooks/*.py 或 src/llmcls/ 之後都要重新產生一次：
+../../.venv/bin/python scripts/build_notebooks.py
 
-**本機看到的 `test.csv` 只有 3 列**，是格式範例，不是真正的評分資料 —— 推論程式碼
-不能假設列數，也不能依賴看得到的那 3 列去快取或調參。
+kaggle kernels push -p notebooks/train_kernel   # 上傳並立刻觸發執行
+kaggle kernels status jameslin45/llm-classification-train-deberta-fold-0
+```
+
+`train_kernel/kernel-metadata.json` 已經設好 GPU、Internet On、`competition_sources`
+掛這場競賽的資料，`push` 之後 Kaggle 就會直接開始跑，不需要再手動到網頁設定。
+
+**注意**：Kaggle 的 kernel push 實測會忽略 `kernel-metadata.json` 裡手動取的 `id`
+slug，改用 `title` 轉出來的 slug（例如 title 是 `LLM Classification - Train DeBERTa
+(fold 0)`，實際 slug 變成 `llm-classification-train-deberta-fold-0`，不是我們原本
+取的 `llmcls-train-deberta`）。push 完務必用 `kaggle kernels status` 或網頁 URL
+確認實際 slug，並把 `kernel-metadata.json` 的 `id` 欄位改成一致，下次 push 才會更新
+同一個 kernel而不是又生出一個新的。
+
+訓練 kernel 確認 valid log loss 贏過 1.0986 之後，再推推論 kernel ——
+`infer_kernel/kernel-metadata.json` 用 `kernel_sources` 接了訓練 kernel 的輸出
+（`jameslin45/llm-classification-train-deberta-fold-0`），Kaggle 會把它的
+`/kaggle/working/` 掛在 `/kaggle/input/llm-classification-train-deberta-fold-0/`，
+`infer_deberta.py` 裡的 `LLMCLS_MODEL_DIR` 已經指到這個路徑：
+
+```bash
+kaggle kernels push -p notebooks/infer_kernel
+kaggle kernels status jameslin45/llm-classification-infer-deberta-submission
+kaggle kernels output jameslin45/llm-classification-infer-deberta-submission -p outputs/infer_kernel_output
+```
+
+## 手動貼到 Kaggle 網頁（備用）
+
+不想用 CLI 的話，把 `train_deberta.py` / `infer_deberta.py` 每個 `# %%` 區塊貼成
+Kaggle Notebook 的一個 cell。第一個 code cell 是
+`>>> 這裡貼 notebooks/_bootstrap_cell.py 的完整內容 <<<` 這行佔位文字，要換成
+`notebooks/_bootstrap_cell.py` 的完整內容（`python scripts/gen_notebook_bootstrap.py
+> notebooks/_bootstrap_cell.py` 產生，`src/llmcls/` 有改動要重新產生）。執行後會把
+原始碼直接寫進 `/kaggle/working/llmcls_src/` 並加進 `sys.path`，`import llmcls` 就
+能用 —— 不需要另外建 Kaggle Dataset 掛程式碼，這條路徑之前在「Dataset 有沒有建對 /
+掛載名稱對不對」上出過 `ModuleNotFoundError`。
+
+這條路徑下 Settings 要自己設（Internet On/Off、Add Data、`LLMCLS_MODEL_DIR` 指到
+實際的掛載路徑），`infer_deberta.py` 裡預設的
+`/kaggle/input/llm-classification-train-deberta-fold-0/...`
+是假設走 CLI push、用 `kernel_sources` 接起來的路徑，手動掛 Dataset 的話要自己改。
+
+## 共用的部分
+
+- `llmcls.config` 偵測到 `/kaggle/input/` 存在時會自動切換 `DATA_DIR`；`MODEL_DIR`
+  則是用 `LLMCLS_MODEL_DIR` 環境變數指到模型的實際掛載路徑。
+- 提交前一定要跑 `validate_submission()`（`save_submission()` 內部已經會呼叫）；
+  Kaggle 只會回報「格式錯誤」，不會告訴你錯在哪一列。
+- **本機看到的 `test.csv` 只有 3 列**，是格式範例，不是真正的評分資料 —— 推論程式碼
+  不能假設列數，也不能依賴看得到的那 3 列去快取或調參。

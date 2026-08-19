@@ -6,7 +6,9 @@
 # Kaggle 會**關閉網路**，所以離線推論必須另開一個 notebook，把這裡存出的權重當
 # Kaggle Dataset 掛進去用。
 #
-# Settings：
+# 用 `kaggle kernels push` 上傳時（見 notebooks/README.md），kernel-metadata.json
+# 已經設好 GPU、Internet On、`competition_sources` 掛這個競賽的資料 —— 不需要手動
+# 在網頁上調整。手動在 Kaggle 網頁貼 cell 的話才需要自己設：
 # - Accelerator：GPU T4 x2（或 P100）
 # - Internet：On
 # - Add Data：這個競賽的資料集 `llm-classification-finetuning`
@@ -19,6 +21,22 @@
 
 # %%
 # >>> 這裡貼 notebooks/_bootstrap_cell.py 的完整內容 <<<
+
+# %% [markdown]
+# 檢查一下 `/kaggle/input` 底下實際掛了什麼、`llmcls.config` 解析出來的路徑對不對 ——
+# `competition_sources` 掛的資料如果不在 `DATA_DIR` 猜的路徑，`load_train()` 會找不到
+# `train.csv`，這個 cell 就是拿來當場抓出真正的掛載路徑用的。
+
+# %%
+import pathlib
+
+print("/kaggle/input 底下：", sorted(p.name for p in pathlib.Path("/kaggle/input").iterdir()))
+
+from llmcls.config import DATA_DIR
+
+print("llmcls.config.DATA_DIR =", DATA_DIR, " exists =", DATA_DIR.exists())
+if DATA_DIR.exists():
+    print("DATA_DIR 底下：", sorted(p.name for p in DATA_DIR.iterdir()))
 
 # %% [markdown]
 # 若 Kaggle 內建的 transformers 版本太舊，才需要下面這行（通常不必要，內建已經夠新）。

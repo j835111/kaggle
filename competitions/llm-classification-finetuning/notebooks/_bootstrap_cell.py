@@ -603,10 +603,10 @@ def predict_test_and_save(trainer_result: dict, name: str = "submission.csv") ->
 ''',
 }
 
-_pkg_dir = pathlib.Path("/kaggle/working/llmcls_src/llmcls")
+_pkg_dir = pathlib.Path("/kaggle/working/llmcls_src/src/llmcls")
 _pkg_dir.mkdir(parents=True, exist_ok=True)
 for _name, _content in _llmcls_files.items():
     (_pkg_dir / _name).write_text(_content, encoding="utf-8")
 
-sys.path.insert(0, "/kaggle/working/llmcls_src")
+sys.path.insert(0, "/kaggle/working/llmcls_src/src")
 print("llmcls bootstrapped:", sorted(p.name for p in _pkg_dir.glob("*.py")))

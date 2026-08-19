@@ -1,0 +1,15 @@
+{
+  "id": "jameslin45/llm-classification-infer-deberta-submission",
+  "title": "LLM Classification - Infer DeBERTa (submission)",
+  "code_file": "infer_deberta.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_tpu": "false",
+  "enable_internet": "false",
+  "dataset_sources": [],
+  "competition_sources": ["llm-classification-finetuning"],
+  "kernel_sources": ["jameslin45/llm-classification-train-deberta-fold-0"],
+  "model_sources": []
+}
