@@ -14,11 +14,16 @@
 
 共用的部分：
 
-1. 把本 repo 以 Kaggle Dataset 的形式掛上（或直接把 `src/llmcls/` 貼進第一個 cell），
-   讓 `import llmcls` 可用。
+1. **把 `src/llmcls` 送進 Kaggle**：兩份草稿的第一個 code cell 都寫著
+   `>>> 這裡貼 notebooks/_bootstrap_cell.py 的完整內容 <<<`。先在本機執行
+   `python scripts/gen_notebook_bootstrap.py > notebooks/_bootstrap_cell.py`
+   （`src/llmcls/` 有改動就要重新產生一次），再把產生的檔案內容整個貼進那個 cell。
+   執行後會把原始碼直接寫進 `/kaggle/working/llmcls_src/` 並加進 `sys.path`，
+   `import llmcls` 就能用了 —— 不需要另外建 Kaggle Dataset 掛程式碼，這條路徑
+   曾經在「Dataset 有沒有建對 / 掛載名稱對不對」上出過 `ModuleNotFoundError`。
 2. `llmcls.config` 偵測到 `/kaggle/input/` 存在時會自動切換 `DATA_DIR`；`MODEL_DIR`
    則是用 `LLMCLS_MODEL_DIR` 環境變數指到模型 Dataset 的掛載路徑（掛載名稱由你在
-   Kaggle UI 上決定，沒辦法預先寫死）。
+   Kaggle UI 上決定，沒辦法預先寫死 —— 訓練完在 Kaggle 的 Output 分頁確認實際路徑）。
 3. 提交前一定要跑 `validate_submission()`（`save_submission()` 內部已經會呼叫）；
    Kaggle 只會回報「格式錯誤」，不會告訴你錯在哪一列。
 

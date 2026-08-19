@@ -14,14 +14,14 @@
 # - Internet：**Off**
 # - Add Data：
 #   1. 這個競賽的資料集 `llm-classification-finetuning`（提供真正的 test.csv）
-#   2. `llmcls-src`（或直接貼原始碼）
-#   3. 訓練 notebook 存出的模型 Dataset（訓練 notebook Save Version 後，在它的
+#   2. 訓練 notebook 存出的模型 Dataset（訓練 notebook Save Version 後，在它的
 #      Output 分頁能直接 "Add" 成這個 notebook 的輸入）
+#
+# 下面第一個 code cell 要換成 `notebooks/_bootstrap_cell.py` 的完整內容（跟訓練
+# notebook 用同一份；只寫本機檔案、不連網路，離線也能跑）。
 
 # %%
-import sys
-
-sys.path.insert(0, "/kaggle/input/llmcls-src/src")
+# >>> 這裡貼 notebooks/_bootstrap_cell.py 的完整內容 <<<
 
 # %%
 import os

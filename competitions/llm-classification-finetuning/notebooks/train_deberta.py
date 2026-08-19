@@ -11,15 +11,14 @@
 # - Internet：On
 # - Add Data：這個競賽的資料集 `llm-classification-finetuning`
 #
-# 把 repo 的 `src/llmcls/`、`scripts/train.py` 上傳成一個 Kaggle Dataset（例如取名
-# `llmcls-src`）掛進來，或者最省事：把 `src/llmcls/*.py` 的內容直接貼進下面標
-# 「貼上 llmcls 原始碼」的 cell。
+# 下面第一個 code cell 要換成 `notebooks/_bootstrap_cell.py` 的完整內容（用
+# `python scripts/gen_notebook_bootstrap.py > notebooks/_bootstrap_cell.py` 產生，
+# `src/llmcls/` 有改動就要重新產生一次再貼）。它會把 `src/llmcls/*.py` 的原始碼直接
+# 寫進 `/kaggle/working/llmcls_src/`，不需要另外建 Kaggle Dataset 掛程式碼
+# ——掛 Dataset 那條路容易在「有沒有建對 / 掛載名稱對不對」上出錯（`ModuleNotFoundError`）。
 
 # %%
-import sys
-
-# 依實際掛載路徑調整；若用「直接貼原始碼」的做法就不需要這行。
-sys.path.insert(0, "/kaggle/input/llmcls-src/src")
+# >>> 這裡貼 notebooks/_bootstrap_cell.py 的完整內容 <<<
 
 # %% [markdown]
 # 若 Kaggle 內建的 transformers 版本太舊，才需要下面這行（通常不必要，內建已經夠新）。
