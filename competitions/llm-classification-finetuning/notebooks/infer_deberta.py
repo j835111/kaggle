@@ -11,24 +11,28 @@
 # - 只需要 CPU 也能跑就跑得動的 batch size；如果掛了 GPU 就順便用。
 #
 # 用 `kaggle kernels push` 上傳時（見 notebooks/README.md），這個 notebook 的
-# kernel-metadata.json 已經用 `kernel_sources` 把訓練 kernel
-# （`jameslin45/llm-classification-train-deberta-fold-0`，注意：Kaggle 會忽略
-# kernel-metadata.json 裡手動取的 id、改用 title 轉出來的 slug，push 完一定要用
-# `kaggle kernels status` 確認實際 slug）的輸出接進來，訓練 kernel 存出的
-# `/kaggle/working/model/fold0/` 會掛在
-# `/kaggle/input/llm-classification-train-deberta-fold-0/model/fold0/`
-# （下面環境變數已經指到這裡）；`competition_sources` 也已經接了這個競賽的資料，
-# `test.csv` 會是真正的隱藏測試集。手動在 Kaggle 網頁上傳的話要自己做這兩件事：
-# Internet 設 Off、Add Data 把訓練 notebook Save Version 後在 Output 分頁能看到的
-# 資料掛進來，並改下面的路徑。
+# kernel-metadata.json 已經用 `kernel_sources` 把訓練 kernel的輸出接進來，
+# `competition_sources` 也已經接了這個競賽的資料，`test.csv` 會是真正的隱藏測試集。
+#
+# **不要猜掛載路徑**——`competition_sources` 實測掛在 `/kaggle/input/competitions/
+# <slug>/` 而不是網頁 UI 那種 `/kaggle/input/<slug>/`；`kernel_sources` 實測也一樣
+# 不是原本猜的 `/kaggle/input/<kernel-slug>/`。下面直接用 glob 找 checkpoint 實際
+# 在哪，不管 Kaggle 這次又把它掛在哪個路徑下都能動。
 
 # %%
 # >>> 這裡貼 notebooks/_bootstrap_cell.py 的完整內容 <<<
 
 # %%
 import os
+import pathlib
 
-os.environ["LLMCLS_MODEL_DIR"] = "/kaggle/input/llm-classification-train-deberta-fold-0/model/fold0"
+_candidates = sorted(pathlib.Path("/kaggle/input").glob("**/fold0/model.safetensors"))
+print("找到的 fold0 checkpoint：", _candidates)
+if not _candidates:
+    print("/kaggle/input 底下的項目：", sorted(str(p) for p in pathlib.Path("/kaggle/input").iterdir()))
+    raise FileNotFoundError("找不到 fold0/model.safetensors —— 檢查 kernel_sources 是否正確接上訓練 kernel")
+os.environ["LLMCLS_MODEL_DIR"] = str(_candidates[0].parent)
+print("LLMCLS_MODEL_DIR =", os.environ["LLMCLS_MODEL_DIR"])
 
 # %%
 from llmcls.config import MAX_LEN, MODEL_DIR

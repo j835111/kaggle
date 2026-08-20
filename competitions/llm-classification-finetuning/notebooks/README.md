@@ -34,9 +34,12 @@ slug，改用 `title` 轉出來的 slug（例如 title 是 `LLM Classification -
 
 訓練 kernel 確認 valid log loss 贏過 1.0986 之後，再推推論 kernel ——
 `infer_kernel/kernel-metadata.json` 用 `kernel_sources` 接了訓練 kernel 的輸出
-（`jameslin45/llm-classification-train-deberta-fold-0`），Kaggle 會把它的
-`/kaggle/working/` 掛在 `/kaggle/input/llm-classification-train-deberta-fold-0/`，
-`infer_deberta.py` 裡的 `LLMCLS_MODEL_DIR` 已經指到這個路徑：
+（`jameslin45/llm-classification-train-deberta-fold-0`）。**掛載路徑不要用猜的**：
+實測 `kernel_sources` 的掛載路徑跟 `competition_sources` 一樣，跟直覺猜的不一樣
+（第一次猜 `/kaggle/input/<kernel-slug>/model/fold0`，實際掛載位置不同，直接
+`HFValidationError` 找不到），`infer_deberta.py` 現在改成用
+`pathlib.Path("/kaggle/input").glob("**/fold0/model.safetensors")` 動態找出真正
+的路徑，不管 Kaggle 這次掛在哪都能動：
 
 ```bash
 kaggle kernels push -p notebooks/infer_kernel
@@ -55,10 +58,8 @@ Kaggle Notebook 的一個 cell。第一個 code cell 是
 能用 —— 不需要另外建 Kaggle Dataset 掛程式碼，這條路徑之前在「Dataset 有沒有建對 /
 掛載名稱對不對」上出過 `ModuleNotFoundError`。
 
-這條路徑下 Settings 要自己設（Internet On/Off、Add Data、`LLMCLS_MODEL_DIR` 指到
-實際的掛載路徑），`infer_deberta.py` 裡預設的
-`/kaggle/input/llm-classification-train-deberta-fold-0/...`
-是假設走 CLI push、用 `kernel_sources` 接起來的路徑，手動掛 Dataset 的話要自己改。
+這條路徑下 Settings 要自己設（Internet On/Off、Add Data）；`LLMCLS_MODEL_DIR` 不用
+自己改，`infer_deberta.py` 會自動 glob 找到掛進來的 checkpoint。
 
 ## 共用的部分
 
