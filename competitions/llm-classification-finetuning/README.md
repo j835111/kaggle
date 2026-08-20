@@ -109,6 +109,14 @@ bash scripts/download_data.sh
     原本的 dtype，跟 `TrainingArguments(fp16=False)` 無關——等於一直在跑沒有
     loss scaler 保護的裸 fp16 訓練，訓練到一半必然 NaN。修法是載入後強制
     `.float()`。
+  - `kernel_sources` 的掛載路徑一樣不能用猜的（跟 `competition_sources` 同一類
+    坑）：實測掛在 `/kaggle/input/notebooks/<owner>/<kernel-slug>/...`，`infer_
+    deberta.py` 改成用 `pathlib.glob` 動態找 checkpoint，不寫死路徑。
+
+離線推論 notebook（`infer_deberta.py`）也已經在 Kaggle 上跑通：關網路、讀訓練
+notebook 存出的 fp32 權重、對 `test.csv` 推論、`validate_submission()` 通過、寫出
+`submission.csv`。里程碑 2 訂的「走完一次 Kaggle Notebook 提交」的流程部分已完成
+——實際送出到排行榜（Kaggle 網頁的 Submit 按鈕）還沒做，等你確認要不要送。
 
 ## 路線圖
 
