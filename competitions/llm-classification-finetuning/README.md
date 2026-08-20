@@ -93,20 +93,30 @@ bash scripts/download_data.sh
 
 尚未驗證：
 
-- **任何牽涉 torch / transformers 的程式碼**（`llmcls/train.py`、`scripts/train.py`、
-  兩份 Kaggle Notebook 草稿）：本機無 GPU，程式碼已寫但完全沒在真的環境跑過。
-  第一次在 Kaggle Notebook 上跑（`train_deberta.py`）就是這批程式碼的第一次實測。
+已在 Kaggle 上實測驗證（GPU T4，`kaggle kernels push` 自動觸發，見
+`notebooks/README.md`）：
+
+- fold 0、DeBERTa-v3-base、2 epochs、lr=2e-5、linear decay：**valid log loss
+  1.08575**（基準 1.09861，改善 +0.01286，`n_nonfinite: 0`，全程無發散）。
+- 實測踩到的坑，修復都在 `llmcls/train.py` / `llmcls/config.py` 裡：
+  - `competition_sources` 透過 API push 掛載時的路徑是
+    `/kaggle/input/competitions/<slug>/`，不是網頁 UI 掛資料集的
+    `/kaggle/input/<slug>/`。
+  - Kaggle 沒指定 `machine_shape` 會自動配到 P100，跟目前的 torch 版本（只支援
+    sm_70+）不相容，必須指定 `NvidiaTeslaT4`。
+  - **關鍵**：`microsoft/deberta-v3-base` 在 HF Hub 上是用 fp16 存的，
+    `AutoModelForSequenceClassification.from_pretrained()` 預設照抄 checkpoint
+    原本的 dtype，跟 `TrainingArguments(fp16=False)` 無關——等於一直在跑沒有
+    loss scaler 保護的裸 fp16 訓練，訓練到一半必然 NaN。修法是載入後強制
+    `.float()`。
 
 ## 路線圖
 
 - [x] 里程碑 0：pipeline 跑通 + 類別先驗 baseline
   （先驗只比 ln(3) 好一點點，本來就是如此 —— 它的用途是驗證管線，不是拿分策略）
 - [x] 里程碑 1：下載真實資料，用真實 schema 重跑上面全部流程
-- [ ] 里程碑 2：DeBERTa-v3-base 三分類微調，prompt + 兩份回覆串接、head+tail 截斷。
-      目標是做出**第一個明顯優於 1.0986** 的分數，並走完一次 Kaggle Notebook 提交
-      **程式碼已就緒**（`llmcls/train.py` + `notebooks/train_deberta.py` /
-      `infer_deberta.py`），還沒在 Kaggle 上實跑過。下一步：先跑 fold 0、2 epochs，
-      確認 valid log loss < 1.0986 再考慮跑滿 5 folds。
+- [x] 里程碑 2：DeBERTa-v3-base 三分類微調，fold 0 跑出 valid log loss 1.08575，
+      優於基準。下一步：跑滿 5 folds、把推論 notebook 走完一次 submission.csv。
 - [ ] 里程碑 3：加上已知有效的手法
   - a/b 對調做資料增強，推論時對兩種順序各跑一次再平均（TTA）—— 對付位置偏誤
   - label smoothing / temperature scaling / 事後校準 —— log loss 吃的是機率校準，不是準確率

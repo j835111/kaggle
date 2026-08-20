@@ -10,7 +10,7 @@
 
 | 競賽 | 指標 | 狀態 |
 | --- | --- | --- |
-| [llm-classification-finetuning](competitions/llm-classification-finetuning/) | multi-class log loss（亂猜 = ln(3) ≈ 1.0986） | 里程碑 1 完成：真實資料 + baseline（OOF 1.09723）。里程碑 2（DeBERTa 微調）程式碼已就緒，待在 Kaggle Notebook 實跑 |
+| [llm-classification-finetuning](competitions/llm-classification-finetuning/) | multi-class log loss（亂猜 = ln(3) ≈ 1.0986） | 里程碑 2 完成：DeBERTa-v3-base fold 0 valid log loss 1.08575，優於基準。下一步：5 folds + 提交 |
 
 ## 目錄慣例
 
