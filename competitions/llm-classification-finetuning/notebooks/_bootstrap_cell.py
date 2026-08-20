@@ -429,6 +429,7 @@ def build_input_ids(
 from __future__ import annotations
 
 import inspect
+import math
 import os
 from pathlib import Path
 
@@ -440,10 +441,11 @@ from transformers import (
     AutoTokenizer,
     DataCollatorWithPadding,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
 )
 
-from llmcls.config import MAX_LEN, MODEL_DIR, MODEL_NAME, N_CLASSES, N_FOLDS
+from llmcls.config import MAX_LEN, MODEL_DIR, MODEL_NAME, N_CLASSES, N_FOLDS, SEED
 from llmcls.cv import add_folds, fold_indices
 from llmcls.data import load_test, load_train
 from llmcls.metrics import UNIFORM_LOGLOSS, log_loss
@@ -478,6 +480,25 @@ class PreferenceDataset(torch.utils.data.Dataset):
         return item
 
 
+class StopOnNonFiniteLoss(TrainerCallback):
+    """DeBERTa-v3 在 fp32、peak LR 附近實測會突然發散：loss 衝高、grad_norm 變 NaN，
+    之後每一步都是壞的，權重永久壞掉但 Trainer 完全不知道、還是把剩下的 epoch 跑完
+    （實測浪費了 83 分鐘 GPU 時間裡的 70 分鐘）。這裡一偵測到就叫它停，把剩下的時間
+    省下來，`triggered` 讓呼叫端知道這次訓練發散過、權重不可信。
+    """
+
+    def __init__(self) -> None:
+        self.triggered = False
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs and any(
+            isinstance(v, (int, float)) and not math.isfinite(v) for k, v in logs.items() if k in ("loss", "grad_norm")
+        ):
+            control.should_training_stop = True
+            self.triggered = True
+        return control
+
+
 def softmax(x: np.ndarray) -> np.ndarray:
     x = x - x.max(axis=-1, keepdims=True)
     e = np.exp(x)
@@ -505,6 +526,7 @@ def _training_args(
     epochs: int,
     batch_size: int,
     lr: float,
+    lr_scheduler_type: str = "linear",
     max_steps: int | None = None,
     eval_steps: int | None = None,
 ) -> TrainingArguments:
@@ -512,13 +534,23 @@ def _training_args(
     # 版本不固定，用 inspect 挑對的參數名比硬編一個更穩。
     params = inspect.signature(TrainingArguments.__init__).parameters
     strategy_key = "eval_strategy" if "eval_strategy" in params else "evaluation_strategy"
+    # 一律用 steps（不是 epoch）當 eval/save 的節奏，完整訓練也一樣 —— 實測 DeBERTa-v3
+    # 在 fp32 訓練到一半會發散，只在 epoch 邊界存檔的話，發散前那個還健康的檢查點根本
+    # 沒機會被存下來，load_best_model_at_end 也就沒有東西可挑。
+    default_eval_steps = max(1, max_steps // 2) if max_steps is not None else 500
+    steps = eval_steps or default_eval_steps
     kwargs = dict(
         output_dir=str(output_dir),
+        **{strategy_key: "steps"},
+        save_strategy="steps",
+        eval_steps=steps,
+        save_steps=steps,
         save_total_limit=1,
         load_best_model_at_end=True,
         metric_for_best_model="log_loss",
         greater_is_better=False,
         learning_rate=lr,
+        lr_scheduler_type=lr_scheduler_type,
         per_device_train_batch_size=batch_size,
         per_device_eval_batch_size=batch_size * 2,
         num_train_epochs=epochs,
@@ -539,13 +571,6 @@ def _training_args(
     )
     if max_steps is not None:
         kwargs["max_steps"] = max_steps
-        kwargs[strategy_key] = "steps"
-        kwargs["save_strategy"] = "steps"
-        kwargs["eval_steps"] = eval_steps or max(1, max_steps // 2)
-        kwargs["save_steps"] = kwargs["eval_steps"]
-    else:
-        kwargs[strategy_key] = "epoch"
-        kwargs["save_strategy"] = "epoch"
     return TrainingArguments(**kwargs)
 
 
@@ -564,21 +589,26 @@ def train_fold(
     epochs: int = 2,
     batch_size: int = 8,
     lr: float = 2e-5,
+    lr_scheduler_type: str = "linear",
     output_dir: Path | None = None,
     max_train_rows: int | None = None,
     max_valid_rows: int | None = None,
     max_steps: int | None = None,
     eval_steps: int | None = None,
 ) -> dict:
-    """練一個 fold，存權重，回傳 {"score", "output_dir", "trainer", "tokenizer"}。
+    """練一個 fold，存權重，回傳 {"score", "n_nonfinite", "diverged", "output_dir",
+    "trainer", "tokenizer"}。
 
     預設只練 fold 0，不是全部 n_folds —— 先確認贏過 baseline_prior.py 印出的分數，
     再決定要不要花時間跑滿整個 CV。
 
     `max_train_rows` / `max_valid_rows` / `max_steps` / `eval_steps` 是煙霧測試用的：
-    拿一小撮資料、跑幾十步就評估一次，把「資料→tokenize→forward→eval→存檔」整條路徑
-    在幾分鐘內走過一遍，而不是每次改動都要賭一整個 epoch（30-60 分鐘 GPU 時間）才知道
-    炸不炸。正式訓練這四個參數都不要傳。
+    隨機抽一小撮資料、跑幾十步就評估一次，把「資料→tokenize→forward→eval→存檔」整條
+    路徑在幾分鐘內走過一遍，而不是每次改動都要賭一整個 epoch（30-60 分鐘 GPU 時間）
+    才知道炸不炸。跑煙霧測試時務必把 `lr_scheduler_type` 設成 "constant_with_warmup"
+    ——用預設的 "linear" 配上 `max_steps` 很小的話，學習率暖身完就立刻開始衰減，
+    根本沒有停留在 peak LR 的時間，測不出「訓練到 peak LR 附近才發散」這種問題
+    （這正是本專案第一次煙霧測試沒抓到、完整訓練卻在 peak LR 附近整個發散的原因）。
     """
     # Kaggle 的 GPU kernel 預設給 T4 x2；HF Trainer 偵測到多張卡會自動包成
     # nn.DataParallel，這是已知會在 eval 階段的 predictions gather 上出怪問題的來源
@@ -601,22 +631,30 @@ def train_fold(
 
     tr_df = train.iloc[tr_idx].reset_index(drop=True)
     va_df = train.iloc[va_idx].reset_index(drop=True)
+    # 用隨機抽樣而不是頭幾列 —— 頭幾列在煙霧測試時永遠是同一批，測不到資料的多樣性。
     if max_train_rows is not None:
-        tr_df = tr_df.iloc[:max_train_rows].reset_index(drop=True)
+        tr_df = tr_df.sample(n=min(max_train_rows, len(tr_df)), random_state=SEED).reset_index(drop=True)
     if max_valid_rows is not None:
-        va_df = va_df.iloc[:max_valid_rows].reset_index(drop=True)
+        va_df = va_df.sample(n=min(max_valid_rows, len(va_df)), random_state=SEED).reset_index(drop=True)
     tr_ds = PreferenceDataset(tr_df, tokenizer, max_len, tr_df["label"].to_numpy())
     va_ds = PreferenceDataset(va_df, tokenizer, max_len, va_df["label"].to_numpy())
 
+    stop_callback = StopOnNonFiniteLoss()
     trainer = Trainer(
         model=model,
-        args=_training_args(output_dir, epochs, batch_size, lr, max_steps=max_steps, eval_steps=eval_steps),
+        args=_training_args(
+            output_dir, epochs, batch_size, lr, lr_scheduler_type=lr_scheduler_type,
+            max_steps=max_steps, eval_steps=eval_steps,
+        ),
         train_dataset=tr_ds,
         eval_dataset=va_ds,
         data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
         compute_metrics=_compute_metrics,
+        callbacks=[stop_callback],
     )
     trainer.train()
+    if stop_callback.triggered:
+        print("偵測到 loss/grad_norm 變成 NaN，已提前停止訓練 —— 這次的權重不可信，不要拿去推論")
 
     # 存檔緊接在 train() 後面、explicit evaluate() 之前 —— load_best_model_at_end=True
     # 已經把最佳權重換回 trainer.model，這裡先存起來，後面的 evaluate() 就算出狀況
@@ -629,15 +667,19 @@ def train_fold(
     score = metrics["eval_log_loss"]
     n_nonfinite = metrics.get("eval_n_nonfinite", 0)
     delta = UNIFORM_LOGLOSS - score
+    # n_nonfinite > 0 代表分數是拿均勻機率湊出來的假象（例如全部 clamp 之後 delta 剛好
+    # 等於 0，會被誤判成「打平基準」）——只要有非有限值，不管 delta 多少一律算沒過關。
+    passed = n_nonfinite == 0 and not stop_callback.triggered and delta > 0
     print(f"\nvalid log loss   {score:.5f}")
     print(f"均勻亂猜基準      {UNIFORM_LOGLOSS:.5f}  (ln 3)")
-    print(f"改善              {delta:+.5f}  {'✓ 優於基準' if delta > 0 else '✗ 未優於基準'}")
+    print(f"改善              {delta:+.5f}  {'✓ 優於基準' if passed else '✗ 未優於基準'}")
     if n_nonfinite:
         print(f"警告：{n_nonfinite}/{len(va_df)} 筆驗證預測是 NaN/inf，已夾到均勻機率計分 —— 分數不可信，先查訓練穩定性")
 
     return {
         "score": score,
         "n_nonfinite": n_nonfinite,
+        "diverged": stop_callback.triggered,
         "output_dir": output_dir,
         "trainer": trainer,
         "tokenizer": tokenizer,

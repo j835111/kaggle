@@ -48,29 +48,53 @@ if DATA_DIR.exists():
 
 # %% [markdown]
 # **先跑煙霧測試，不要直接跑整個 epoch。** 完整訓練一個 epoch 在 T4 上要 30-60
-# 分鐘，改一行程式碼就要賭這麼久才知道有沒有炸，太貴。這裡只拿 2000 筆訓練資料、
-# 60 步、每 30 步評估一次 —— 把「資料→tokenize→forward→eval→存檔」整條路徑在幾
-# 分鐘內走過一遍。看到 `n_nonfinite` 是 0、log loss 是有限數字，才進到下面完整訓練。
+# 分鐘，改一行程式碼就要賭這麼久才知道有沒有炸，太貴（第一次完整訓練就實測發散，
+# 白燒了 83 分鐘 GPU 時間）。
+#
+# 這裡的煙霧測試刻意把 `lr_scheduler_type` 設成 `"constant_with_warmup"`、只跑
+# 100 步：暖身後學習率會停在 peak LR 不再衰減，才測得出「訓練到 peak LR 附近才
+# 發散」這種問題 —— 用預設的線性衰減配上很小的 `max_steps`，暖身一結束 LR 立刻
+# 開始下降，煙霧測試永遠測不到問題（這正是第一次踩到的坑）。
+#
+# 先用 `lr=2e-5`（跟完整訓練同一個學習率）測；如果發散就自動降到 `lr=1e-5` 重試。
 
 # %%
 from llmcls.train import train_fold
 
-smoke = train_fold(
-    fold=0, epochs=1, batch_size=8, max_len=512, lr=2e-5,
-    max_train_rows=2000, max_valid_rows=500, max_steps=60, eval_steps=30,
-    output_dir="/kaggle/working/model/_smoke",
+
+def _smoke(lr: float) -> dict:
+    print(f"--- 煙霧測試：lr={lr}, constant_with_warmup, max_steps=100 ---")
+    r = train_fold(
+        fold=0, epochs=1, batch_size=8, max_len=512, lr=lr,
+        lr_scheduler_type="constant_with_warmup",
+        max_train_rows=3000, max_valid_rows=800, max_steps=100, eval_steps=50,
+        output_dir="/kaggle/working/model/_smoke",
+    )
+    print(f"lr={lr}: log loss={r['score']:.5f}  n_nonfinite={r['n_nonfinite']}  diverged={r['diverged']}")
+    return r
+
+
+smoke = _smoke(2e-5)
+train_lr = 2e-5
+if smoke["diverged"] or smoke["n_nonfinite"] > 0:
+    print("peak LR 2e-5 在煙霧測試就發散，改用 1e-5 重試")
+    smoke = _smoke(1e-5)
+    train_lr = 1e-5
+
+assert not smoke["diverged"] and smoke["n_nonfinite"] == 0, (
+    f"lr={train_lr} 煙霧測試仍然發散，需要人工調整（更低的 lr / 更保守的設定），先不要跑完整訓練"
 )
-print(f"煙霧測試 log loss: {smoke['score']:.5f}  n_nonfinite: {smoke['n_nonfinite']}")
-assert smoke["n_nonfinite"] == 0, "煙霧測試就出現 NaN/inf 預測，別跑完整訓練，先查訓練穩定性"
+print(f"煙霧測試通過，完整訓練用 lr={train_lr}")
 
 # %% [markdown]
-# 煙霧測試過關（`n_nonfinite == 0`）後才跑完整訓練。先只練 fold 0。valid log loss
-# 必須小於 1.09861（ln 3）—— 這是本專案判斷分數的唯一標準，也是
-# scripts/baseline_prior.py 在真實資料上印出的基準（1.09723）。如果沒贏過，先別急著
-# 跑其他 fold，回頭檢查 max_len / 學習率。
+# 煙霧測試過關後才跑完整訓練，用煙霧測試驗證過的 `train_lr`。valid log loss 必須
+# 小於 1.09861（ln 3）—— 這是本專案判斷分數的唯一標準，也是 scripts/baseline_prior.py
+# 在真實資料上印出的基準（1.09723）。就算煙霧測試過了，完整訓練還是有步進式存檔
+# （每 500 步）跟發散偵測保護，不會再像第一次那樣白燒一整個 epoch。
 
 # %%
-result = train_fold(fold=0, epochs=2, batch_size=8, max_len=512, lr=2e-5)
+result = train_fold(fold=0, epochs=2, batch_size=8, max_len=512, lr=train_lr, eval_steps=500)
+assert not result["diverged"] and result["n_nonfinite"] == 0, "完整訓練發散或有非有限值，模型權重不可信，不要拿去推論"
 
 # %% [markdown]
 # `train_fold()` 已經把權重存到 `MODEL_DIR/fold0`（預設 `/kaggle/working/model/fold0`），
