@@ -46,12 +46,30 @@ if DATA_DIR.exists():
 # %%
 # !pip install -q -U transformers accelerate
 
+# %% [markdown]
+# **先跑煙霧測試，不要直接跑整個 epoch。** 完整訓練一個 epoch 在 T4 上要 30-60
+# 分鐘，改一行程式碼就要賭這麼久才知道有沒有炸，太貴。這裡只拿 2000 筆訓練資料、
+# 60 步、每 30 步評估一次 —— 把「資料→tokenize→forward→eval→存檔」整條路徑在幾
+# 分鐘內走過一遍。看到 `n_nonfinite` 是 0、log loss 是有限數字，才進到下面完整訓練。
+
 # %%
 from llmcls.train import train_fold
 
-# 先只練 fold 0。valid log loss 必須小於 1.09861（ln 3）—— 這是本專案判斷分數的
-# 唯一標準，也是 scripts/baseline_prior.py 在真實資料上印出的基準（1.09723）。
-# 如果沒贏過，先別急著跑其他 fold，回頭檢查 max_len / 學習率。
+smoke = train_fold(
+    fold=0, epochs=1, batch_size=8, max_len=512, lr=2e-5,
+    max_train_rows=2000, max_valid_rows=500, max_steps=60, eval_steps=30,
+    output_dir="/kaggle/working/model/_smoke",
+)
+print(f"煙霧測試 log loss: {smoke['score']:.5f}  n_nonfinite: {smoke['n_nonfinite']}")
+assert smoke["n_nonfinite"] == 0, "煙霧測試就出現 NaN/inf 預測，別跑完整訓練，先查訓練穩定性"
+
+# %% [markdown]
+# 煙霧測試過關（`n_nonfinite == 0`）後才跑完整訓練。先只練 fold 0。valid log loss
+# 必須小於 1.09861（ln 3）—— 這是本專案判斷分數的唯一標準，也是
+# scripts/baseline_prior.py 在真實資料上印出的基準（1.09723）。如果沒贏過，先別急著
+# 跑其他 fold，回頭檢查 max_len / 學習率。
+
+# %%
 result = train_fold(fold=0, epochs=2, batch_size=8, max_len=512, lr=2e-5)
 
 # %% [markdown]
