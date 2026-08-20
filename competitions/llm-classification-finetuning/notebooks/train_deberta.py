@@ -48,26 +48,28 @@ if DATA_DIR.exists():
 
 # %% [markdown]
 # **先跑煙霧測試，不要直接跑整個 epoch。** 完整訓練一個 epoch 在 T4 上要 30-60
-# 分鐘，改一行程式碼就要賭這麼久才知道有沒有炸，太貴（第一次完整訓練就實測發散，
-# 白燒了 83 分鐘 GPU 時間）。
+# 分鐘，改一行程式碼就要賭這麼久才知道有沒有炸，太貴 —— 前幾次完整訓練都實測發散
+# 過（grad_norm 變 NaN、權重永久壞掉），一路查下來真正的原因是：deberta-v3-base
+# 在 HF Hub 上是用 **fp16** 存的，新版 transformers 的 `from_pretrained` 預設照抄
+# checkpoint 原本的 dtype，跟 `TrainingArguments(fp16=False)` 完全無關 —— 等於一直
+# 在跑「沒有 loss scaler 保護的裸 fp16 訓練」，梯度撐不了多久就溢位成 NaN。
+# `train_fold()` 現在會強制 `.float()`，並且印出實際的 dtype 供確認。
 #
-# 這裡的煙霧測試刻意把 `lr_scheduler_type` 設成 `"constant_with_warmup"`、只跑
-# 100 步：暖身後學習率會停在 peak LR 不再衰減，才測得出「訓練到 peak LR 附近才
-# 發散」這種問題 —— 用預設的線性衰減配上很小的 `max_steps`，暖身一結束 LR 立刻
-# 開始下降，煙霧測試永遠測不到問題（這正是第一次踩到的坑）。
-#
-# 先用 `lr=2e-5`（跟完整訓練同一個學習率）測；如果發散就自動降到 `lr=1e-5` 重試。
+# 煙霧測試刻意把 `lr_scheduler_type` 設成 `"constant_with_warmup"`、跑 400 步：
+# 暖身後學習率會停在 peak LR 不再衰減，才測得出「訓練到 peak LR 附近才發散」這種
+# 問題；步數也拉大到 400（實測發散發生在 peak LR 之後 40~260 步不等，100 步太短，
+# 有一次沒抓到）。lr 沿用完整訓練的 2e-5；如果 dtype 修好了還是發散，才降到 1e-5。
 
 # %%
 from llmcls.train import train_fold
 
 
 def _smoke(lr: float) -> dict:
-    print(f"--- 煙霧測試：lr={lr}, constant_with_warmup, max_steps=100 ---")
+    print(f"--- 煙霧測試：lr={lr}, constant_with_warmup, max_steps=400 ---")
     r = train_fold(
         fold=0, epochs=1, batch_size=8, max_len=512, lr=lr,
         lr_scheduler_type="constant_with_warmup",
-        max_train_rows=3000, max_valid_rows=800, max_steps=100, eval_steps=50,
+        max_train_rows=3000, max_valid_rows=800, max_steps=400, eval_steps=200,
         output_dir="/kaggle/working/model/_smoke",
     )
     print(f"lr={lr}: log loss={r['score']:.5f}  n_nonfinite={r['n_nonfinite']}  diverged={r['diverged']}")
@@ -77,12 +79,12 @@ def _smoke(lr: float) -> dict:
 smoke = _smoke(2e-5)
 train_lr = 2e-5
 if smoke["diverged"] or smoke["n_nonfinite"] > 0:
-    print("peak LR 2e-5 在煙霧測試就發散，改用 1e-5 重試")
+    print("lr=2e-5 在煙霧測試還是發散，改用 1e-5 重試（dtype 應該已經修好，這是次要防線）")
     smoke = _smoke(1e-5)
     train_lr = 1e-5
 
 assert not smoke["diverged"] and smoke["n_nonfinite"] == 0, (
-    f"lr={train_lr} 煙霧測試仍然發散，需要人工調整（更低的 lr / 更保守的設定），先不要跑完整訓練"
+    f"lr={train_lr} 煙霧測試仍然發散，dtype 修復可能沒生效或另有原因，先不要跑完整訓練"
 )
 print(f"煙霧測試通過，完整訓練用 lr={train_lr}")
 

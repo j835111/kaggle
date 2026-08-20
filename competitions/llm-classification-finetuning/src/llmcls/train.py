@@ -88,18 +88,26 @@ def softmax(x: np.ndarray) -> np.ndarray:
     return e / e.sum(axis=-1, keepdims=True)
 
 
+# log_loss 不可能自然達到的高值，只用來確保「發散」在 metric_for_best_model 排序上
+# 一定輸給任何健康的 checkpoint（見 _compute_metrics 的說明）。
+_NONFINITE_SENTINEL = 99.0
+
+
 def _compute_metrics(eval_pred) -> dict:
     """log_loss() 對非法機率值嚴格報錯（這是它的正確行為，見 metrics.py）；但這裡是
-    Trainer 的 eval callback，一炸整個 run 就白跑、連權重都存不到。改成統計有幾列非
-    有限值、夾到均勻機率再算分，異常本身用 n_nonfinite 回報，不讓它摧毀整次訓練。
+    Trainer 的 eval callback，一炸整個 run 就白跑、連權重都存不到，所以不能用 raise。
+
+    早期版本把非有限值夾到均勻機率再算分——結果發散的 checkpoint 剛好算出
+    log loss = ln(3)，而 greater_is_better=False 之下 ln(3) 比任何健康 checkpoint
+    的分數都「小」，load_best_model_at_end 反而會選中發散的那個。改成回報一個大到
+    不可能自然出現的哨兵值，讓發散的 checkpoint 在排序上必輸。
     """
     logits, labels = eval_pred
     probs = softmax(np.asarray(logits))
     finite = np.isfinite(probs).all(axis=1)
     n_nonfinite = int((~finite).sum())
     if n_nonfinite:
-        probs = probs.copy()
-        probs[~finite] = 1.0 / N_CLASSES
+        return {"log_loss": _NONFINITE_SENTINEL, "vs_uniform": float("nan"), "n_nonfinite": n_nonfinite}
     score = log_loss(labels, probs)
     return {"log_loss": score, "vs_uniform": UNIFORM_LOGLOSS - score, "n_nonfinite": n_nonfinite}
 
@@ -211,6 +219,13 @@ def train_fold(
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=N_CLASSES)
+    # 實測 deberta-v3-base 在 HF Hub 上是用 fp16 存的，新版 transformers 的
+    # from_pretrained 預設照抄 checkpoint 原本的 dtype，跟 TrainingArguments(fp16=False)
+    # 完全無關 —— 結果是在跑「沒有 loss scaler 保護的裸 fp16 訓練」，梯度撐不了多久
+    # 就溢位成 NaN，調低學習率只是延後發生、不是解法。強制轉 fp32 才是真正對應
+    # fp16=False 的意圖。
+    print(f"model 載入時的 dtype：{next(model.parameters()).dtype}")
+    model = model.float()
 
     tr_df = train.iloc[tr_idx].reset_index(drop=True)
     va_df = train.iloc[va_idx].reset_index(drop=True)
@@ -272,7 +287,7 @@ def train_fold(
 def load_trained(output_dir: Path):
     """從已存的權重目錄載入 model + tokenizer（供推論 notebook 用，不需要 Trainer）。"""
     tokenizer = AutoTokenizer.from_pretrained(str(output_dir))
-    model = AutoModelForSequenceClassification.from_pretrained(str(output_dir))
+    model = AutoModelForSequenceClassification.from_pretrained(str(output_dir)).float()
     return model, tokenizer
 
 
