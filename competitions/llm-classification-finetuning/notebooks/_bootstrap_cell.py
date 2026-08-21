@@ -537,6 +537,7 @@ def _training_args(
     lr_scheduler_type: str = "linear",
     max_steps: int | None = None,
     eval_steps: int | None = None,
+    fp16: bool = True,
 ) -> TrainingArguments:
     # transformers 把 evaluation_strategy 改名成 eval_strategy 過；Kaggle Notebook 內建的
     # 版本不固定，用 inspect 挑對的參數名比硬編一個更穩。
@@ -544,8 +545,11 @@ def _training_args(
     strategy_key = "eval_strategy" if "eval_strategy" in params else "evaluation_strategy"
     # 一律用 steps（不是 epoch）當 eval/save 的節奏，完整訓練也一樣 —— 實測 DeBERTa-v3
     # 在 fp32 訓練到一半會發散，只在 epoch 邊界存檔的話，發散前那個還健康的檢查點根本
-    # 沒機會被存下來，load_best_model_at_end 也就沒有東西可挑。
-    default_eval_steps = max(1, max_steps // 2) if max_steps is not None else 500
+    # 沒機會被存下來，load_best_model_at_end 也就沒有東西可挑。1500 是給完整訓練用的
+    # 預設值：跟 eval_subset_rows 搭配（train_fold 會把訓練中途的評估換成子集），
+    # 拉開頻率不會犧牲發散偵測 —— 那是每 50 步看 loss/grad_norm 的 StopOnNonFiniteLoss
+    # callback 在管，跟這裡的 eval 節奏無關。
+    default_eval_steps = max(1, max_steps // 2) if max_steps is not None else 1500
     steps = eval_steps or default_eval_steps
     kwargs = dict(
         output_dir=str(output_dir),
@@ -564,11 +568,13 @@ def _training_args(
         num_train_epochs=epochs,
         warmup_ratio=0.1,
         weight_decay=0.01,
-        # fp16 混合精度在 Kaggle 目前的 transformers/accelerate 組合下，DeBERTa-v3
-        # 第一次 backward 就炸「Attempting to unscale FP16 gradients」（已知相容性
-        # 問題）。T4 記憶體對 deberta-v3-base + batch_size 8 + max_len 512 綽綽有餘，
-        # 先用 fp32 求正確跑通，混合精度是效能優化、不是里程碑 2 的目標。
-        fp16=False,
+        # 第一次踩到的坑是模型「裸」用 fp16（checkpoint 原本就存 fp16，from_pretrained
+        # 沒有轉型），完全沒有 loss scaler 保護。train_fold() 現在會先強制 model.float()
+        # 轉成真正的 fp32，這裡的 fp16=True 才是正規流程：autocast 動態轉型 + GradScaler
+        # 做 loss scaling，梯度真的非有限值時 GradScaler 會跳過那一步而不是把權重弄壞，
+        # StopOnNonFiniteLoss 則是最後一道防線。T4 有 fp16 tensor core，這樣才吃得到
+        # 混合精度的加速。
+        fp16=fp16,
         report_to=[],
         logging_steps=10 if max_steps else 50,
         # 關掉 tqdm 進度條、強制用純文字 print 記錄 loss —— Kaggle Notebook 預設會用
@@ -598,11 +604,13 @@ def train_fold(
     batch_size: int = 8,
     lr: float = 2e-5,
     lr_scheduler_type: str = "linear",
+    fp16: bool = True,
     output_dir: Path | None = None,
     max_train_rows: int | None = None,
     max_valid_rows: int | None = None,
     max_steps: int | None = None,
     eval_steps: int | None = None,
+    eval_subset_rows: int | None = None,
 ) -> dict:
     """練一個 fold，存權重，回傳 {"score", "n_nonfinite", "diverged", "output_dir",
     "trainer", "tokenizer"}。
@@ -617,6 +625,17 @@ def train_fold(
     ——用預設的 "linear" 配上 `max_steps` 很小的話，學習率暖身完就立刻開始衰減，
     根本沒有停留在 peak LR 的時間，測不出「訓練到 peak LR 附近才發散」這種問題
     （這正是本專案第一次煙霧測試沒抓到、完整訓練卻在 peak LR 附近整個發散的原因）。
+
+    `eval_subset_rows` 是完整訓練用的加速選項：訓練中途的週期性評估只在這個子集上跑
+    （原本每次評估都對完整驗證集跑一次，實測光是評估就佔掉總訓練時間近一半），最後
+    收斂完仍然會對完整驗證集重新 `evaluate()` 一次，回傳的 `score` 保證是完整驗證集
+    的分數，不會被子集的雜訊污染。
+
+    `batch_size` 調大要非常小心：煙霧測試只能驗證穩定性（會不會發散），驗不出「完整
+    資料集上的記憶體上限」——`max_train_rows` 抽樣的子集很難剛好抽到全是接近
+    `max_len` 上限的最壞情況那幾批。實測 batch_size=16 在 3000 筆的煙霧測試上完全
+    穩定，換成完整的 45746 筆卻在訓練中途 CUDA OOM（T4 記憶體只差 66MB）。batch_size
+    調大之前，煙霧測試過關不代表完整資料集上安全。
     """
     # Kaggle 的 GPU kernel 預設給 T4 x2；HF Trainer 偵測到多張卡會自動包成
     # nn.DataParallel，這是已知會在 eval 階段的 predictions gather 上出怪問題的來源
@@ -654,15 +673,22 @@ def train_fold(
     tr_ds = PreferenceDataset(tr_df, tokenizer, max_len, tr_df["label"].to_numpy())
     va_ds = PreferenceDataset(va_df, tokenizer, max_len, va_df["label"].to_numpy())
 
+    # 訓練中途的週期性評估用子集（快很多），最後才對完整驗證集重新算一次真正的分數。
+    if eval_subset_rows is not None and eval_subset_rows < len(va_df):
+        va_df_periodic = va_df.sample(n=eval_subset_rows, random_state=SEED).reset_index(drop=True)
+        va_ds_periodic = PreferenceDataset(va_df_periodic, tokenizer, max_len, va_df_periodic["label"].to_numpy())
+    else:
+        va_ds_periodic = va_ds
+
     stop_callback = StopOnNonFiniteLoss()
     trainer = Trainer(
         model=model,
         args=_training_args(
             output_dir, epochs, batch_size, lr, lr_scheduler_type=lr_scheduler_type,
-            max_steps=max_steps, eval_steps=eval_steps,
+            max_steps=max_steps, eval_steps=eval_steps, fp16=fp16,
         ),
         train_dataset=tr_ds,
-        eval_dataset=va_ds,
+        eval_dataset=va_ds_periodic,
         data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
         compute_metrics=_compute_metrics,
         callbacks=[stop_callback],
@@ -678,7 +704,9 @@ def train_fold(
     tokenizer.save_pretrained(str(output_dir))
     print(f"模型已存到 {output_dir}")
 
-    metrics = trainer.evaluate()
+    # 明確傳完整的 va_ds —— 訓練中途用的可能是子集，最終回報的分數必須是完整驗證集
+    # 算出來的，不能被子集的雜訊污染。
+    metrics = trainer.evaluate(eval_dataset=va_ds)
     score = metrics["eval_log_loss"]
     n_nonfinite = metrics.get("eval_n_nonfinite", 0)
     delta = UNIFORM_LOGLOSS - score

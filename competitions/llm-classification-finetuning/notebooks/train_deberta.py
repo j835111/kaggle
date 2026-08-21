@@ -47,55 +47,61 @@ if DATA_DIR.exists():
 # !pip install -q -U transformers accelerate
 
 # %% [markdown]
-# **先跑煙霧測試，不要直接跑整個 epoch。** 完整訓練一個 epoch 在 T4 上要 30-60
-# 分鐘，改一行程式碼就要賭這麼久才知道有沒有炸，太貴 —— 前幾次完整訓練都實測發散
-# 過（grad_norm 變 NaN、權重永久壞掉），一路查下來真正的原因是：deberta-v3-base
-# 在 HF Hub 上是用 **fp16** 存的，新版 transformers 的 `from_pretrained` 預設照抄
-# checkpoint 原本的 dtype，跟 `TrainingArguments(fp16=False)` 完全無關 —— 等於一直
-# 在跑「沒有 loss scaler 保護的裸 fp16 訓練」，梯度撐不了多久就溢位成 NaN。
-# `train_fold()` 現在會強制 `.float()`，並且印出實際的 dtype 供確認。
+# **先跑煙霧測試，不要直接跑整個 epoch。** 里程碑 2 第一次完整訓練（fold 0、
+# batch_size=8、fp32、每 500 步對完整驗證集算一次分數）花了將近 9 小時，其中光是
+# 評估就佔掉將近一半 —— 這裡在原本已經驗證過穩定的設定上加兩個加速手段，跑之前先用
+# 煙霧測試確認沒有引入新的不穩定：
 #
-# 煙霧測試刻意把 `lr_scheduler_type` 設成 `"constant_with_warmup"`、跑 400 步：
-# 暖身後學習率會停在 peak LR 不再衰減，才測得出「訓練到 peak LR 附近才發散」這種
-# 問題；步數也拉大到 400（實測發散發生在 peak LR 之後 40~260 步不等，100 步太短，
-# 有一次沒抓到）。lr 沿用完整訓練的 2e-5；如果 dtype 修好了還是發散，才降到 1e-5。
+# 1. `fp16=True`：train_fold() 已經會先強制 `model.float()` 轉成真正的 fp32，
+#    這裡的 fp16 是正規的 autocast + GradScaler 混合精度 —— 跟里程碑 2 除錯過程中
+#    踩到的「裸 fp16、沒有 loss scaler」完全不同，梯度真的非有限值時 GradScaler
+#    會跳過那一步而不是把權重弄壞，`StopOnNonFiniteLoss` 仍是最後一道防線。
+# 2. `eval_subset_rows`：訓練中途的週期性評估改成只對一小撮驗證集跑（快很多），
+#    最後才對完整驗證集重新算一次真正的分數 —— 發散偵測本來就跟評估頻率無關
+#    （`StopOnNonFiniteLoss` 每 50 步看一次 loss/grad_norm），拉開評估頻率不會
+#    犧牲安全網。
+#
+# `batch_size` 原本也想從 8 調到 16 —— 煙霧測試（3000 筆子集）完全穩定通過，但換成
+# 完整的 45746 筆資料後，訓練中途在某一批剛好全是接近 max_len 上限的長序列時 CUDA
+# OOM 了（T4 記憶體只差 66MB）。**煙霧測試只能驗證穩定性，驗不出完整資料集上的
+# 記憶體上限** —— 子集抽樣很難剛好抽到最壞情況的那幾批，所以 `batch_size` 維持
+# 里程碑 2 已經在完整資料集上證明過安全的 8，不冒這個風險。
+#
+# 煙霧測試維持跟里程碑 2 一樣的做法：`lr_scheduler_type="constant_with_warmup"`、
+# 跑 400 步，讓學習率停在 peak 不再衰減，才測得出「訓練到 peak LR 附近才發散」
+# 這種問題。
 
 # %%
 from llmcls.train import train_fold
 
-
-def _smoke(lr: float) -> dict:
-    print(f"--- 煙霧測試：lr={lr}, constant_with_warmup, max_steps=400 ---")
-    r = train_fold(
-        fold=0, epochs=1, batch_size=8, max_len=512, lr=lr,
-        lr_scheduler_type="constant_with_warmup",
-        max_train_rows=3000, max_valid_rows=800, max_steps=400, eval_steps=200,
-        output_dir="/kaggle/working/model/_smoke",
-    )
-    print(f"lr={lr}: log loss={r['score']:.5f}  n_nonfinite={r['n_nonfinite']}  diverged={r['diverged']}")
-    return r
-
-
-smoke = _smoke(2e-5)
-train_lr = 2e-5
-if smoke["diverged"] or smoke["n_nonfinite"] > 0:
-    print("lr=2e-5 在煙霧測試還是發散，改用 1e-5 重試（dtype 應該已經修好，這是次要防線）")
-    smoke = _smoke(1e-5)
-    train_lr = 1e-5
-
-assert not smoke["diverged"] and smoke["n_nonfinite"] == 0, (
-    f"lr={train_lr} 煙霧測試仍然發散，dtype 修復可能沒生效或另有原因，先不要跑完整訓練"
+smoke = train_fold(
+    fold=0, epochs=1, batch_size=8, max_len=512, lr=2e-5,
+    lr_scheduler_type="constant_with_warmup", fp16=True,
+    max_train_rows=3000, max_valid_rows=800, max_steps=400, eval_steps=200,
+    output_dir="/kaggle/working/model/_smoke",
 )
-print(f"煙霧測試通過，完整訓練用 lr={train_lr}")
+print(f"log loss={smoke['score']:.5f}  n_nonfinite={smoke['n_nonfinite']}  diverged={smoke['diverged']}")
+assert not smoke["diverged"] and smoke["n_nonfinite"] == 0, (
+    "加速設定（fp16=True）在煙霧測試就不穩定，先不要跑完整訓練"
+)
+print("煙霧測試通過，加速設定沒有引入不穩定")
 
 # %% [markdown]
-# 煙霧測試過關後才跑完整訓練，用煙霧測試驗證過的 `train_lr`。valid log loss 必須
-# 小於 1.09861（ln 3）—— 這是本專案判斷分數的唯一標準，也是 scripts/baseline_prior.py
-# 在真實資料上印出的基準（1.09723）。就算煙霧測試過了，完整訓練還是有步進式存檔
-# （每 500 步）跟發散偵測保護，不會再像第一次那樣白燒一整個 epoch。
+# 煙霧測試過關後才跑完整訓練。valid log loss 必須小於 1.09861（ln 3）—— 這是本專案
+# 判斷分數的唯一標準，也是 scripts/baseline_prior.py 在真實資料上印出的基準
+# （1.09723）。步進式存檔（每 1500 步）跟發散偵測保護都還在，不會再白燒一整個
+# epoch。`eval_subset_rows=2000` 讓訓練中途的評估變快，最終回報的分數保證是對
+# 完整驗證集算出來的。
 
 # %%
-result = train_fold(fold=0, epochs=2, batch_size=8, max_len=512, lr=train_lr, eval_steps=500)
+import time
+
+_t0 = time.time()
+result = train_fold(
+    fold=0, epochs=2, batch_size=8, max_len=512, lr=2e-5,
+    fp16=True, eval_steps=1500, eval_subset_rows=2000,
+)
+print(f"訓練總耗時：{time.time() - _t0:.0f}s")
 assert not result["diverged"] and result["n_nonfinite"] == 0, "完整訓練發散或有非有限值，模型權重不可信，不要拿去推論"
 
 # %% [markdown]
