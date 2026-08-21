@@ -1,0 +1,16 @@
+{
+  "id": "jameslin45/llm-classification-calibrate-deberta-fold-0",
+  "title": "LLM Classification - Calibrate DeBERTa (fold 0)",
+  "code_file": "calibrate_fold0.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_tpu": "false",
+  "enable_internet": "false",
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [],
+  "competition_sources": ["llm-classification-finetuning"],
+  "kernel_sources": ["jameslin45/llm-classification-train-deberta-fold-0"],
+  "model_sources": []
+}

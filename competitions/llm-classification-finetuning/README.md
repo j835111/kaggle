@@ -125,6 +125,33 @@ notebook 存出的 fp32 權重、對 `test.csv` 推論、`validate_submission()`
 `submission.csv`，並已經送到排行榜：**143/212**（第一次送出、單一 fold、沒有
 TTA / 校準 / ensemble）。
 
+**里程碑 3（TTA + 校準）已在 fold 0 驗證集上量測完成**（`notebooks/calibrate_fold0.py`，
+不重新訓練，只對已存的 fold0 權重量測）：
+
+| 組合 | valid log loss | 相對 baseline |
+|---|---|---|
+| baseline（milestone 2，已送出 143/212） | 1.08495 | — |
+| 單獨對調順序（診斷位置偏誤用） | 1.08439 | -0.00056 |
+| TTA（a/b 對調平均） | 1.08416 | +0.00078 |
+| temperature scaling（T=1.458） | 1.08157 | +0.00338 |
+| **TTA + temperature（T=1.429，已套進 infer_deberta.py）** | **1.08112** | **+0.00383** |
+
+位置偏誤本身很小（單獨對調順序只差 0.00056，遠低於判斷「有沒有明顯位置偏誤」的
+0.01 門檻），TTA 單獨效果有限，校準才是主要來源；兩者疊加仍略優於只用校準，所以
+`infer_deberta.py` 兩個一起套用。T 是在 fold 0 自己的 held-out 驗證集（11731 列）
+上配的（`llmcls/calibration.py` 的 `fit_temperature()`，網格搜尋 + 逐步細化，
+只有一個純量參數，held-out 資料上配它不算作弊）。新的推論 kernel（改成
+`predict_logits_with_tta()` + `apply_temperature()`）已經在 Kaggle 上跑通，格式驗證
+通過，還沒送出新的排行榜分數。
+
+新增的 `llmcls/tta.py`（a/b 欄位對齊 + 平均）、`llmcls/calibration.py`
+（temperature scaling）都是純 numpy，24+9 項本機測試涵蓋（不用真的模型也測得到
+欄位對齊有沒有搞反、溫度配出來的方向對不對）。順手把 `PreferenceDataset` 的
+tokenize 從逐列 `tokenizer.encode()` 改成整批呼叫（fast tokenizer 的平行化在批次
+呼叫內部做，逐列呼叫的 FFI 開銷在 TTA 兩種順序各 tokenize 一次時尤其浪費）；
+推論本身已經只需要幾分鐘，fp16/autocast + 加大 batch size 這類推論加速沒有必要，
+效能心力留給訓練端（`group_by_length` 之類）。
+
 ## 路線圖
 
 - [x] 里程碑 0：pipeline 跑通 + 類別先驗 baseline
@@ -134,9 +161,11 @@ TTA / 校準 / ensemble）。
       優於基準，已送出排行榜 143/212。訓練加速後單一 fold 約 1.7 小時（原本
       將近 9 小時），跑滿 5 folds 現在只要約 8.5 小時，milestone 3 前可以考慮先做。
 - [ ] 里程碑 3：加上已知有效的手法
-  - a/b 對調做資料增強，推論時對兩種順序各跑一次再平均（TTA）—— 對付位置偏誤
-  - label smoothing / temperature scaling / 事後校準 —— log loss 吃的是機率校準，不是準確率
-  - 針對 `winner_tie` 這一類的處理（通常是最難、也是 loss 的主要來源）
+  - [x] a/b 對調 TTA + temperature scaling：fold 0 驗證集量測 1.08495 → 1.08112，
+        已套進 `infer_deberta.py`，還沒送出新的排行榜分數
+  - [ ] label smoothing（需要重新訓練，還沒做——先確認 TTA/校準這條路有沒有用）
+  - [ ] a/b 對調當「訓練時」的資料增強（目前只做了推論時的 TTA，訓練資料還沒加這個增強）
+  - [ ] 針對 `winner_tie` 這一類的處理（通常是最難、也是 loss 的主要來源）
 - [ ] 里程碑 4：換更大的模型 + LoRA + 4bit 量化（需要自有 GPU 或雲端 GPU）
 
 ## 參考

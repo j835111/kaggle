@@ -12,6 +12,12 @@ UNIFORM_LOGLOSS = float(np.log(N_CLASSES))
 EPS = 1e-15
 
 
+def softmax(x: np.ndarray) -> np.ndarray:
+    x = x - x.max(axis=-1, keepdims=True)
+    e = np.exp(x)
+    return e / e.sum(axis=-1, keepdims=True)
+
+
 def log_loss(y_true: np.ndarray, y_prob: np.ndarray, eps: float = EPS) -> float:
     """multi-class log loss。y_true 是整數 label，y_prob 是 (n, n_classes) 機率。
 

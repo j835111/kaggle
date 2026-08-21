@@ -31,9 +31,10 @@ from transformers import (
 from llmcls.config import MAX_LEN, MODEL_DIR, MODEL_NAME, N_CLASSES, N_FOLDS, SEED
 from llmcls.cv import add_folds, fold_indices
 from llmcls.data import load_test, load_train
-from llmcls.metrics import UNIFORM_LOGLOSS, log_loss
+from llmcls.metrics import UNIFORM_LOGLOSS, log_loss, softmax
 from llmcls.submission import build_submission, save_submission
 from llmcls.text import build_input_ids
+from llmcls.tta import average_swapped
 
 
 class PreferenceDataset(torch.utils.data.Dataset):
@@ -44,9 +45,13 @@ class PreferenceDataset(torch.utils.data.Dataset):
         self.max_len = max_len
         self.labels = labels
         # 預先 encode 三欄一次，__getitem__ 只做截斷 + 拼接，不用每個 epoch 重複 tokenize。
-        self.prompt_ids = [tokenizer.encode(t, add_special_tokens=False) for t in df["prompt_text"]]
-        self.response_a_ids = [tokenizer.encode(t, add_special_tokens=False) for t in df["response_a_text"]]
-        self.response_b_ids = [tokenizer.encode(t, add_special_tokens=False) for t in df["response_b_text"]]
+        # 整批呼叫 tokenizer(...)，不要逐列呼叫 tokenizer.encode()——fast tokenizer 的
+        # 平行化是在批次呼叫內部做的（Rust 那邊自己開執行緒），逐列呼叫每次都要重新付一次
+        # Python↔Rust FFI 的固定開銷，資料量上萬列時這筆開銷不能忽略，TTA 又是同一批文字
+        # 重新 tokenize 兩次（正常順序 + 對調順序），批次呼叫能把這個成本壓下去。
+        self.prompt_ids = tokenizer(df["prompt_text"].tolist(), add_special_tokens=False)["input_ids"]
+        self.response_a_ids = tokenizer(df["response_a_text"].tolist(), add_special_tokens=False)["input_ids"]
+        self.response_b_ids = tokenizer(df["response_b_text"].tolist(), add_special_tokens=False)["input_ids"]
 
     def __len__(self) -> int:
         return len(self.prompt_ids)
@@ -80,12 +85,6 @@ class StopOnNonFiniteLoss(TrainerCallback):
             control.should_training_stop = True
             self.triggered = True
         return control
-
-
-def softmax(x: np.ndarray) -> np.ndarray:
-    x = x - x.max(axis=-1, keepdims=True)
-    e = np.exp(x)
-    return e / e.sum(axis=-1, keepdims=True)
 
 
 # log_loss 不可能自然達到的高值，只用來確保「發散」在 metric_for_best_model 排序上
@@ -171,11 +170,29 @@ def _training_args(
     return TrainingArguments(**kwargs)
 
 
+def predict_logits(trainer: Trainer, tokenizer, df: pd.DataFrame, max_len: int) -> np.ndarray:
+    """對沒有 label 的 DataFrame（例如 test set）跑推論，回傳 (n, N_CLASSES) 的原始 logits
+    （softmax 之前）——temperature scaling 要在這個尺度上配溫度，不能對已經 softmax
+    過的機率配。
+    """
+    ds = PreferenceDataset(df, tokenizer, max_len, labels=None)
+    return np.asarray(trainer.predict(ds).predictions)
+
+
 def predict_probs(trainer: Trainer, tokenizer, df: pd.DataFrame, max_len: int) -> np.ndarray:
     """對沒有 label 的 DataFrame（例如 test set）跑推論，回傳 (n, N_CLASSES) 機率。"""
-    ds = PreferenceDataset(df, tokenizer, max_len, labels=None)
-    logits = trainer.predict(ds).predictions
-    return softmax(np.asarray(logits))
+    return softmax(predict_logits(trainer, tokenizer, df, max_len))
+
+
+def swap_ab(df: pd.DataFrame) -> pd.DataFrame:
+    """回傳 response_a_text / response_b_text 對調後的複本，其餘欄位不變 ——
+    PreferenceDataset 只讀這兩欄跟 prompt_text 建輸入，對調這兩欄就等於把
+    response_a / response_b 的順序整個倒過來重新推論一次。
+    """
+    swapped = df.copy()
+    swapped["response_a_text"] = df["response_b_text"].to_numpy()
+    swapped["response_b_text"] = df["response_a_text"].to_numpy()
+    return swapped
 
 
 def train_fold(
@@ -319,20 +336,48 @@ def load_trained(output_dir: Path):
     return model, tokenizer
 
 
-def predict_with_model(model, tokenizer, df: pd.DataFrame, max_len: int, batch_size: int = 32) -> np.ndarray:
-    """離線推論 notebook 用：不需要 Trainer / TrainingArguments，直接跑 forward。"""
+def predict_logits_with_model(model, tokenizer, df: pd.DataFrame, max_len: int, batch_size: int = 32) -> np.ndarray:
+    """離線推論 notebook 用：不需要 Trainer / TrainingArguments，直接跑 forward，
+    回傳 softmax 之前的原始 logits（temperature scaling 要配在這個尺度上）。
+    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device).eval()
     ds = PreferenceDataset(df, tokenizer, max_len, labels=None)
     collator = DataCollatorWithPadding(tokenizer=tokenizer)
-    all_probs = []
+    all_logits = []
     with torch.no_grad():
         for start in range(0, len(ds), batch_size):
             batch = [ds[i] for i in range(start, min(start + batch_size, len(ds)))]
             inputs = collator(batch).to(device)
             logits = model(**inputs).logits.detach().cpu().numpy()
-            all_probs.append(softmax(logits))
-    return np.concatenate(all_probs, axis=0)
+            all_logits.append(logits)
+    return np.concatenate(all_logits, axis=0)
+
+
+def predict_with_model(model, tokenizer, df: pd.DataFrame, max_len: int, batch_size: int = 32) -> np.ndarray:
+    """離線推論 notebook 用：不需要 Trainer / TrainingArguments，直接跑 forward。"""
+    return softmax(predict_logits_with_model(model, tokenizer, df, max_len, batch_size))
+
+
+def predict_logits_with_tta(model, tokenizer, df: pd.DataFrame, max_len: int, batch_size: int = 32) -> np.ndarray:
+    """a/b 對調 TTA，回傳原始順序與對調順序（已換回欄位對齊）logits 的平均。
+
+    對付位置偏誤：模型可能學到偏好放在 A 或 B 位置本身，而不是回覆的品質。回傳
+    logits（不是機率）是為了跟 temperature scaling 串接——要接著配溫度的話，必須
+    先在 logits 尺度合併成一組，再對『合併後的 logits』配溫度，在機率層級平均、
+    再對已經攤平過的機率配溫度會失真。單純只要 TTA、不接 calibration 的話，直接
+    對這裡回傳的結果做 softmax 即可。
+    """
+    logits_orig = predict_logits_with_model(model, tokenizer, df, max_len, batch_size)
+    logits_swapped = predict_logits_with_model(model, tokenizer, swap_ab(df), max_len, batch_size)
+    return average_swapped(logits_orig, logits_swapped)
+
+
+def predict_with_tta(model, tokenizer, df: pd.DataFrame, max_len: int, batch_size: int = 32) -> np.ndarray:
+    """a/b 對調 TTA：原始順序跟對調順序各推論一次，換回欄位對齊後在機率層級平均。"""
+    probs_orig = predict_with_model(model, tokenizer, df, max_len, batch_size)
+    probs_swapped = predict_with_model(model, tokenizer, swap_ab(df), max_len, batch_size)
+    return average_swapped(probs_orig, probs_swapped)
 
 
 def predict_test_and_save(trainer_result: dict, name: str = "submission.csv") -> Path:
