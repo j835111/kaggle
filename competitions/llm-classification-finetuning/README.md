@@ -97,7 +97,14 @@ bash scripts/download_data.sh
 `notebooks/README.md`）：
 
 - fold 0、DeBERTa-v3-base、2 epochs、lr=2e-5、linear decay：**valid log loss
-  1.08575**（基準 1.09861，改善 +0.01286，`n_nonfinite: 0`，全程無發散）。
+  1.08494**（基準 1.09861，改善 +0.01367，`n_nonfinite: 0`，全程無發散），
+  **訓練總耗時 6051 秒（約 1.68 小時）**——第一次跑通花了將近 9 小時，靠正規
+  fp16 混合精度（`fp16=True`，`model.float()` 之後才啟用，是有 GradScaler
+  保護的真混合精度，跟除錯過程中踩到的裸 fp16 不同）+ 訓練中途評估改用子集
+  （`eval_subset_rows`，最終分數仍是對完整驗證集算的）兩項加速，快了約 5.4 倍。
+  `batch_size` 也試過 8→16：煙霧測試（3000 筆子集）完全穩定，換成完整
+  45746 筆卻在某批全是長序列時 CUDA OOM（只差 66MB）——煙霧測試驗得出穩定性，
+  驗不出完整資料集的記憶體上限，所以維持 `batch_size=8`。
 - 實測踩到的坑，修復都在 `llmcls/train.py` / `llmcls/config.py` 裡：
   - `competition_sources` 透過 API push 掛載時的路徑是
     `/kaggle/input/competitions/<slug>/`，不是網頁 UI 掛資料集的
@@ -115,16 +122,17 @@ bash scripts/download_data.sh
 
 離線推論 notebook（`infer_deberta.py`）也已經在 Kaggle 上跑通：關網路、讀訓練
 notebook 存出的 fp32 權重、對 `test.csv` 推論、`validate_submission()` 通過、寫出
-`submission.csv`。里程碑 2 訂的「走完一次 Kaggle Notebook 提交」的流程部分已完成
-——實際送出到排行榜（Kaggle 網頁的 Submit 按鈕）還沒做，等你確認要不要送。
+`submission.csv`，並已經送到排行榜：**143/212**（第一次送出、單一 fold、沒有
+TTA / 校準 / ensemble）。
 
 ## 路線圖
 
 - [x] 里程碑 0：pipeline 跑通 + 類別先驗 baseline
   （先驗只比 ln(3) 好一點點，本來就是如此 —— 它的用途是驗證管線，不是拿分策略）
 - [x] 里程碑 1：下載真實資料，用真實 schema 重跑上面全部流程
-- [x] 里程碑 2：DeBERTa-v3-base 三分類微調，fold 0 跑出 valid log loss 1.08575，
-      優於基準。下一步：跑滿 5 folds、把推論 notebook 走完一次 submission.csv。
+- [x] 里程碑 2：DeBERTa-v3-base 三分類微調，fold 0 跑出 valid log loss 1.08494，
+      優於基準，已送出排行榜 143/212。訓練加速後單一 fold 約 1.7 小時（原本
+      將近 9 小時），跑滿 5 folds 現在只要約 8.5 小時，milestone 3 前可以考慮先做。
 - [ ] 里程碑 3：加上已知有效的手法
   - a/b 對調做資料增強，推論時對兩種順序各跑一次再平均（TTA）—— 對付位置偏誤
   - label smoothing / temperature scaling / 事後校準 —— log loss 吃的是機率校準，不是準確率
