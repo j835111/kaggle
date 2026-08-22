@@ -125,24 +125,29 @@ notebook 存出的 fp32 權重、對 `test.csv` 推論、`validate_submission()`
 `submission.csv`，並已經送到排行榜：**143/212**（第一次送出、單一 fold、沒有
 TTA / 校準 / ensemble）。
 
-**里程碑 3（TTA + 校準）已在 fold 0 驗證集上量測完成**（`notebooks/calibrate_fold0.py`，
-不重新訓練，只對已存的 fold0 權重量測）：
+**里程碑 3（TTA + 校準）已在全部 5 個 fold 上量測完成**（`notebooks/calibrate_folds.py`，
+不重新訓練，每個 fold 用自己的驗證集重新配溫度 T，不套用其他 fold 的值）：
 
-| 組合 | valid log loss | 相對 baseline |
-|---|---|---|
-| baseline（milestone 2，已送出 143/212） | 1.08495 | — |
-| 單獨對調順序（診斷位置偏誤用） | 1.08439 | -0.00056 |
-| TTA（a/b 對調平均） | 1.08416 | +0.00078 |
-| temperature scaling（T=1.458） | 1.08157 | +0.00338 |
-| **TTA + temperature（T=1.429，已套進 infer_deberta.py）** | **1.08112** | **+0.00383** |
+| fold | baseline | TTA | temperature | TTA+temperature | T（各自配的） |
+|---|---|---|---|---|---|
+| 0 | 1.06839 | 1.06039 | 1.06382 | 1.05904 | 1.192 |
+| 1 | 1.05459 | 1.04339 | 1.05137 | 1.04256 | 1.055 |
+| 2 | 1.07392 | 1.07244 | 1.07099 | 1.07019 | 1.331 |
+| 3 | 1.08028 | 1.07928 | 1.07406 | 1.07358 | 1.514 |
+| 4 | 1.05712 | 1.04740 | 1.05417 | 1.04711 | 1.097 |
 
-位置偏誤本身很小（單獨對調順序只差 0.00056，遠低於判斷「有沒有明顯位置偏誤」的
-0.01 門檻），TTA 單獨效果有限，校準才是主要來源；兩者疊加仍略優於只用校準，所以
-`infer_deberta.py` 兩個一起套用。T 是在 fold 0 自己的 held-out 驗證集（11731 列）
-上配的（`llmcls/calibration.py` 的 `fit_temperature()`，網格搜尋 + 逐步細化，
-只有一個純量參數，held-out 資料上配它不算作弊）。新的推論 kernel（改成
-`predict_logits_with_tta()` + `apply_temperature()`）已經在 Kaggle 上跑通，格式驗證
-通過，還沒送出新的排行榜分數。
+**5/5 個 fold 都有改善**，平均改善 +0.00836（標準差 0.00288，明顯大於雜訊）——不是
+單一切分的巧合，但 5 個 fold 共用同一套模型/recipe/資料分布，不是 5 個真正獨立的
+實驗，不保證效果量完全轉移到隱藏測試集。T 值跨 fold 差異不小（1.055~1.514，平均
+1.238，標準差 0.167），`infer_deberta.py` 套用跨 fold 平均 **T=1.238**（不是 fold 0
+自己配出來的 1.192）——單一 fold 配出來的 T 對那個 fold 最準，但雜訊也最大，跨
+fold 平均更穩。
+
+**fold 0 在這次順便被重新訓練過一次**（詳見下面的 5-fold 訓練段落），驗證分數從
+milestone 2 送出 143/212 那次的 1.08494 降到 1.06839——這是目前推論版本相對上次
+排行榜結果的主要改善來源，TTA/校準（+0.00935）是疊加上去的第二層。推論 kernel
+（`predict_logits_with_tta()` + `apply_temperature(T=1.238)`）已經用新 fold 0 權重
+在 Kaggle 上跑通、格式驗證通過，還沒送出新的排行榜分數。
 
 新增的 `llmcls/tta.py`（a/b 欄位對齊 + 平均）、`llmcls/calibration.py`
 （temperature scaling）都是純 numpy，24+9 項本機測試涵蓋（不用真的模型也測得到
@@ -152,6 +157,34 @@ tokenize 從逐列 `tokenizer.encode()` 改成整批呼叫（fast tokenizer 的�
 推論本身已經只需要幾分鐘，fp16/autocast + 加大 batch size 這類推論加速沒有必要，
 效能心力留給訓練端（`group_by_length` 之類）。
 
+**5 folds 全部練完**（`train_deberta.py`，驗證 milestone 3 手法是不是只在 fold 0
+這份切分上剛好有效，而不是普遍成立）：
+
+| fold | valid log loss |
+|---|---|
+| 0 | 1.06840 |
+| 1 | 1.05461 |
+| 2 | 1.07391 |
+| 3 | 1.08028 |
+| 4 | 1.05712 |
+
+全部優於基準 1.09861。第一次嘗試 5 folds 一次跑完時踩到一個新坑：`train_fold()`
+的 `output_dir` 同時是 `TrainingArguments` 的 checkpoint 目錄跟最終存檔目錄，
+Trainer 自己 `save_steps` 存的 `checkpoint-*/`（含 optimizer/scheduler state，
+體積是模型本身的 2-3 倍）訓練完沒清掉，5 個 fold 疊起來直接把 Kaggle 磁碟塞爆
+（`OSError: No space left on device`，練到 fold 4 過半才炸，fold 0-3 其實都順利
+存好了）。修法：`trainer.save_model()` 之後自動清掉 `output_dir` 底下的
+`checkpoint-*/`，每個 fold 只留最終權重（~700MB，不是 ~2.8GB）。搶救 fold 0-3
+的做法：把它們的權重下載下來、包成一個新的 Kaggle Dataset（`dataset_sources`
+掛進訓練 kernel），`train_deberta.py` 開頭會先檢查有沒有掛之前的權重、有的話
+複製過來跳過重新訓練——第二次只花約 1.9 小時（重練 fold 4 + 複製 fold 0-3）
+就補完整個 5-fold，不用整個重來一次 8.5 小時。
+
+**下一步（還沒做）**：目前推論還是只用單一 fold 0（+ TTA + 校準）。5 個 fold 都
+練完了，5-fold 機率平均 ensemble 應該還能再進一步改善（沒做過，不確定實際幅度），
+以及 milestone 3 剩下的 label smoothing、訓練時 a/b 對調增強、`winner_tie` 特殊
+處理都還沒開始。
+
 ## 路線圖
 
 - [x] 里程碑 0：pipeline 跑通 + 類別先驗 baseline
@@ -159,13 +192,16 @@ tokenize 從逐列 `tokenizer.encode()` 改成整批呼叫（fast tokenizer 的�
 - [x] 里程碑 1：下載真實資料，用真實 schema 重跑上面全部流程
 - [x] 里程碑 2：DeBERTa-v3-base 三分類微調，fold 0 跑出 valid log loss 1.08494，
       優於基準，已送出排行榜 143/212。訓練加速後單一 fold 約 1.7 小時（原本
-      將近 9 小時），跑滿 5 folds 現在只要約 8.5 小時，milestone 3 前可以考慮先做。
+      將近 9 小時）。**5 folds 已全部練完**（1.06840 / 1.05461 / 1.07391 /
+      1.08028 / 1.05712，全數優於基準）。
 - [ ] 里程碑 3：加上已知有效的手法
-  - [x] a/b 對調 TTA + temperature scaling：fold 0 驗證集量測 1.08495 → 1.08112，
-        已套進 `infer_deberta.py`，還沒送出新的排行榜分數
+  - [x] a/b 對調 TTA + temperature scaling：5 folds 各自驗證，5/5 都有改善
+        （平均 +0.00836），已套進 `infer_deberta.py`（fold 0 + T=1.238），
+        還沒送出新的排行榜分數
   - [ ] label smoothing（需要重新訓練，還沒做——先確認 TTA/校準這條路有沒有用）
   - [ ] a/b 對調當「訓練時」的資料增強（目前只做了推論時的 TTA，訓練資料還沒加這個增強）
   - [ ] 針對 `winner_tie` 這一類的處理（通常是最難、也是 loss 的主要來源）
+  - [ ] 5-fold 機率平均 ensemble（5 folds 都練完了，還沒做）
 - [ ] 里程碑 4：換更大的模型 + LoRA + 4bit 量化（需要自有 GPU 或雲端 GPU）
 
 ## 參考

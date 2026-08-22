@@ -1,7 +1,7 @@
 {
-  "id": "jameslin45/llm-classification-calibrate-deberta-fold-0",
-  "title": "LLM Classification - Calibrate DeBERTa (fold 0)",
-  "code_file": "calibrate_fold0.ipynb",
+  "id": "jameslin45/llm-classification-calibrate-deberta-all-folds",
+  "title": "LLM Classification - Calibrate DeBERTa (all folds)",
+  "code_file": "calibrate_folds.ipynb",
   "language": "python",
   "kernel_type": "notebook",
   "is_private": "true",

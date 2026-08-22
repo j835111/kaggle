@@ -1,5 +1,5 @@
 # %% [markdown]
-# # 訓練 DeBERTa-v3-base（里程碑 2）
+# # 訓練 DeBERTa-v3-base（里程碑 2 + 里程碑 3 的 5-fold 驗證）
 #
 # 這是**訓練** notebook，跟推論 notebook（`infer_deberta.py`）分開 —— 訓練需要連網路
 # 從 HuggingFace Hub 下載 base model 權重，但這題是 code competition，正式推論時
@@ -92,29 +92,74 @@ print("煙霧測試通過，加速設定沒有引入不穩定")
 # （1.09723）。步進式存檔（每 1500 步）跟發散偵測保護都還在，不會再白燒一整個
 # epoch。`eval_subset_rows=2000` 讓訓練中途的評估變快，最終回報的分數保證是對
 # 完整驗證集算出來的。
+#
+# **這裡練滿全部 5 個 fold**——milestone 3 的 TTA + temperature scaling 只在 fold 0
+# 單一份驗證集上量過改善（+0.00383），單一切分的量測有可能只是那份驗證集剛好對這個
+# 手法有利，5 個 fold 各自獨立驗證同一個改善才有說服力。
+#
+# **實測踩過的坑（已修復）**：第一次跑 5 folds 時，`_training_args()` 的
+# `output_dir` 跟 `trainer.save_model()` 的最終存檔目錄是同一個路徑，Trainer 自己
+# `save_steps` 週期性存的 `checkpoint-*/`（含 optimizer/scheduler state，體積是
+# 模型本身的 2-3 倍）一直沒清掉，5 個 fold 疊起來直接把 Kaggle 磁碟塞爆
+# （`OSError: No space left on device`，練到 fold 4 過半才炸）。`train_fold()`
+# 現在會在 `trainer.save_model()` 之後自動清掉 `output_dir` 底下的 `checkpoint-*/`，
+# 每個 fold 只留最終權重（~700MB，不是 ~2.8GB）。
+#
+# 那次事故裡 fold 0-3 其實都順利練完、分數都贏過基準（1.06840 / 1.05461 / 1.07391 /
+# 1.08028），只有 fold 4 沒存到——下面會先檢查 `/kaggle/input` 有沒有掛之前留下來的
+# 權重，有的話直接複製過來、略過重新訓練，不用 5 個全部重練一次。
 
 # %%
+import pathlib
+import shutil
 import time
 
-_t0 = time.time()
-result = train_fold(
-    fold=0, epochs=2, batch_size=8, max_len=512, lr=2e-5,
-    fp16=True, eval_steps=1500, eval_subset_rows=2000,
-)
-print(f"訓練總耗時：{time.time() - _t0:.0f}s")
-assert not result["diverged"] and result["n_nonfinite"] == 0, "完整訓練發散或有非有限值，模型權重不可信，不要拿去推論"
+from llmcls.config import MODEL_DIR, N_FOLDS
 
-# %% [markdown]
-# `train_fold()` 已經把權重存到 `MODEL_DIR/fold0`（預設 `/kaggle/working/model/fold0`），
-# 印出的 valid log loss 也已經跟 ln(3) 比較過。
+# 如果有掛之前的訓練成果（例如上一次中途出錯，這次接續跑），先複製過來、跳過
+# 已經練好的 fold，不用整個重來。找不到就當作全新開始，不影響正常流程。
 #
-# 確認贏過基準之後：**Save Version**（Save & Run All），存出的 Version 的
-# `/kaggle/working/model/` 就會變成一個新的 Kaggle Dataset（在 Notebook 的 Output
-# 分頁），下一步把它掛進 `infer_deberta.py`。
-#
-# 之後要跑滿 5 folds，就是把上面的 `fold=0` 換成 0..4 各跑一次，每個 fold 都會分別
-# 存到 `model/fold{N}/`；推論時對 5 個 fold 的機率取平均（等 milestone 3 再做，這裡
-# 先求有一個 fold 能打敗基準）。
+# 檔名是攤平的 `fold{N}__檔名`（不是巢狀資料夾）——上傳 Kaggle Dataset 時，
+# 巢狀資料夾要嘛跳過、要嘛整個壓成一個 zip/tar，`--dir-mode` 實際行為（會不會
+# 自動解壓縮回資料夾）沒把握，攤平成單層檔名最保險，不用賭 Kaggle 那端怎麼處理。
+for _p in pathlib.Path("/kaggle/input").glob("**/fold*__model.safetensors"):
+    fold_name, _ = _p.name.split("__", 1)
+    dst = MODEL_DIR / fold_name
+    if not dst.exists():
+        dst.mkdir(parents=True)
+        for _f in _p.parent.glob(f"{fold_name}__*"):
+            _, filename = _f.name.split("__", 1)
+            shutil.copy(_f, dst / filename)
+        print(f"{fold_name} 已從先前的權重複製過來，略過重新訓練")
 
 # %%
-print(f"fold 0 valid log loss: {result['score']:.5f}")
+fold_scores = {}
+for fold in range(N_FOLDS):
+    dst = MODEL_DIR / f"fold{fold}"
+    if (dst / "model.safetensors").exists():
+        print(f"fold {fold} 已經有存好的權重（{dst}），略過重新訓練")
+        continue
+    _t0 = time.time()
+    result = train_fold(
+        fold=fold, epochs=2, batch_size=8, max_len=512, lr=2e-5,
+        fp16=True, eval_steps=1500, eval_subset_rows=2000,
+    )
+    print(f"fold {fold} 訓練總耗時：{time.time() - _t0:.0f}s")
+    assert not result["diverged"] and result["n_nonfinite"] == 0, (
+        f"fold {fold} 完整訓練發散或有非有限值，模型權重不可信，不要拿去推論"
+    )
+    fold_scores[fold] = result["score"]
+    print(f"fold {fold} valid log loss: {result['score']:.5f}")
+
+# %% [markdown]
+# 每個 fold 都已經存到 `MODEL_DIR/fold{N}`（預設 `/kaggle/working/model/fold{N}`）。
+#
+# 確認全部贏過基準之後：**Save Version**（Save & Run All），存出的 Version 的
+# `/kaggle/working/model/` 就會變成一個新的 Kaggle Dataset（在 Notebook 的 Output
+# 分頁），下一步把它掛進 `calibrate_folds.py`（重新驗證 TTA/校準在 5 個 fold 上是否
+# 一致改善）跟 `infer_deberta.py`。
+
+# %%
+print("五個 fold 的 valid log loss：")
+for fold, score in fold_scores.items():
+    print(f"  fold {fold}: {score:.5f}")

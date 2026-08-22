@@ -1,21 +1,27 @@
 # %% [markdown]
 # # 推論（提交用）
 #
-# **里程碑 3 更新**：套用 `notebooks/calibrate_fold0.py` 在 fold 0 驗證集（11731 列）
-# 上量測到的最佳組合——a/b 對調 TTA + temperature scaling（T=1.429）：
+# **里程碑 3 更新**：`notebooks/calibrate_folds.py` 對 5 個 fold 各自量測過
+# a/b 對調 TTA + temperature scaling（每個 fold 用自己的驗證集重新配 T），
+# 5/5 個 fold 都有改善，平均改善 +0.00836（標準差 0.00288，明顯大於雜訊）：
 #
-# | 組合 | valid log loss | 相對 baseline |
-# |---|---|---|
-# | baseline（milestone 2，已送出 143/212） | 1.08495 | — |
-# | 單獨對調順序（診斷位置偏誤用） | 1.08439 | -0.00056 |
-# | TTA（a/b 對調平均） | 1.08416 | +0.00078 |
-# | temperature scaling | 1.08157 | +0.00338 |
-# | **TTA + temperature（目前用的）** | **1.08112** | **+0.00383** |
+# | fold | baseline | TTA+temperature | T（各自配的） |
+# |---|---|---|---|
+# | 0（推論用這個） | 1.06839 | **1.05904** | 1.192 |
+# | 1 | 1.05459 | 1.04256 | 1.055 |
+# | 2 | 1.07392 | 1.07019 | 1.331 |
+# | 3 | 1.08028 | 1.07358 | 1.514 |
+# | 4 | 1.05712 | 1.04711 | 1.097 |
 #
-# 位置偏誤本身很小（單獨對調順序只差 0.00056，遠低於 0.01），TTA 單獨效果有限，
-# 校準才是主要來源；兩者疊加仍然比只用校準略好，所以兩個一起套用。T 值是在 fold 0
-# 自己的 held-out 驗證集上配的（只有一個純量參數，held-out 資料上配它不算作弊），
-# 不是在這個 notebook 看得到的 test.csv 上配的。
+# T 值跨 fold 差異不小（1.055~1.514，平均 1.238，標準差 0.167）——單一 fold 配出來
+# 的 T 對那個 fold 來說最準，但拿掉單一 fold 的雜訊之後，跨 fold 平均是更穩的估計，
+# 所以套用時用 **T=1.238**（5-fold 平均），不是 fold 0 自己配出來的 1.192。
+#
+# fold 0 本身也在這次搶救 5-fold 訓練時被重新訓練過一次（驗證分數從 1.08494
+# 降到 1.06839），跟 milestone 2 送出 143/212 那次用的權重不是同一份——這是
+# 目前這個推論版本相對上一次排行榜結果的主要改善來源，TTA/校準是疊加上去的
+# 第二層改善。（5 個 fold 共用同一套模型/recipe/資料分布，不是 5 個獨立實驗，
+# 一致改善代表這不是單一切分的巧合，但不保證效果量完全轉移到隱藏測試集。）
 #
 # 這是**推論** notebook，跟訓練 notebook（`train_deberta.py`）分開。這題是 code
 # competition，正式評分時 Kaggle 會把這個 notebook 的網路關掉，直接重跑一次，
@@ -57,9 +63,9 @@ from llmcls.data import load_test
 from llmcls.submission import build_submission, save_submission
 from llmcls.train import load_trained, predict_logits_with_tta
 
-# fold 0 驗證集（11731 列）上配出來的溫度（notebooks/calibrate_fold0.py 的
-# TTA + temperature 組合，valid log loss 1.08112，見上面的說明）。
-FITTED_TEMPERATURE = 1.429
+# 5-fold 平均溫度（notebooks/calibrate_folds.py 的量測結果，見上面的說明），
+# 不是 fold 0 自己配出來的 1.192——跨 fold 平均比單一 fold 的估計更穩。
+FITTED_TEMPERATURE = 1.238
 
 model, tokenizer = load_trained(MODEL_DIR)
 

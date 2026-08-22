@@ -104,7 +104,7 @@ def build_one(py_path: Path, out_path: Path) -> None:
 def main() -> int:
     build_one(NOTEBOOKS_DIR / "train_deberta.py", NOTEBOOKS_DIR / "train_kernel" / "train_deberta.ipynb")
     build_one(NOTEBOOKS_DIR / "infer_deberta.py", NOTEBOOKS_DIR / "infer_kernel" / "infer_deberta.ipynb")
-    build_one(NOTEBOOKS_DIR / "calibrate_fold0.py", NOTEBOOKS_DIR / "calibrate_kernel" / "calibrate_fold0.ipynb")
+    build_one(NOTEBOOKS_DIR / "calibrate_folds.py", NOTEBOOKS_DIR / "calibrate_kernel" / "calibrate_folds.ipynb")
     return 0
 
 

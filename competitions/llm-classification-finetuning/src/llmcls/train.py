@@ -14,6 +14,7 @@ from __future__ import annotations
 import inspect
 import math
 import os
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -302,7 +303,16 @@ def train_fold(
     # 也不會白跑一整個 epoch 的 GPU 時間卻什麼都沒留下。
     trainer.save_model(str(output_dir))
     tokenizer.save_pretrained(str(output_dir))
-    print(f"模型已存到 {output_dir}")
+
+    # TrainingArguments 的 output_dir 跟這裡的最終存檔目錄是同一個路徑，Trainer 自己
+    # 的 save_steps 週期性存檔（含 optimizer/scheduler state，體積是模型本身的 2-3
+    # 倍）還留在 output_dir/checkpoint-*/ 底下，跟上面剛存好的最終權重是同一份東西的
+    # 重複備份。單一 fold 時這筆多餘的空間還在 Kaggle 磁碟額度內，5 個 fold 一次跑完
+    # 疊起來就會把磁碟塞爆（實測踩到：5 folds 沒清、跑到一半磁碟就滿了）。權重已經
+    # 存到 output_dir 頂層，這些子目錄可以直接刪掉。
+    for checkpoint_dir in output_dir.glob("checkpoint-*"):
+        shutil.rmtree(checkpoint_dir)
+    print(f"模型已存到 {output_dir}（訓練中途的 checkpoint-* 已清除）")
 
     # 明確傳完整的 va_ds —— 訓練中途用的可能是子集，最終回報的分數必須是完整驗證集
     # 算出來的，不能被子集的雜訊污染。

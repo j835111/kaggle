@@ -9,7 +9,7 @@
   "enable_tpu": "false",
   "enable_internet": "true",
   "machine_shape": "NvidiaTeslaT4",
-  "dataset_sources": [],
+  "dataset_sources": ["jameslin45/llm-classification-fold0-3-checkpoints"],
   "competition_sources": ["llm-classification-finetuning"],
   "kernel_sources": [],
   "model_sources": []

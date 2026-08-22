@@ -47,15 +47,16 @@ kaggle kernels status jameslin45/llm-classification-infer-deberta-submission
 kaggle kernels output jameslin45/llm-classification-infer-deberta-submission -p outputs/infer_kernel_output
 ```
 
-訓練跟推論之間還有一個**校準實驗** kernel（`calibrate_fold0.py` /
-`calibrate_kernel/`）——不重新訓練，只在 fold 0 自己的驗證集上量測 TTA（a/b 對調
-平均）、temperature scaling、兩者疊加分別能不能贏過 baseline，決定哪個組合值得
-套進 `infer_deberta.py`：
+訓練跟推論之間還有一個**校準實驗** kernel（`calibrate_folds.py` /
+`calibrate_kernel/`）——不重新訓練，對訓練 kernel 存出的每個 fold 各自在自己的
+驗證集上量測 TTA（a/b 對調平均）、temperature scaling（每個 fold 各自重新配 T，
+不套用其他 fold 配出來的值）、兩者疊加分別能不能贏過 baseline，5 個 fold 一起看
+才知道這個改善是不是單一切分的巧合，決定哪個組合值得套進 `infer_deberta.py`：
 
 ```bash
 kaggle kernels push -p notebooks/calibrate_kernel
-kaggle kernels status jameslin45/llm-classification-calibrate-fold-0
-kaggle kernels output jameslin45/llm-classification-calibrate-fold-0 -p outputs/calibrate_kernel_output
+kaggle kernels status jameslin45/llm-classification-calibrate-deberta-all-folds
+kaggle kernels output jameslin45/llm-classification-calibrate-deberta-all-folds -p outputs/calibrate_kernel_output
 ```
 
 `kernel_sources` 跟 `infer_kernel` 一樣接訓練 kernel 的輸出、`enable_internet: false`
