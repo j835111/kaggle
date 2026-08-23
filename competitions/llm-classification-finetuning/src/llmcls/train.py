@@ -122,6 +122,7 @@ def _training_args(
     eval_steps: int | None = None,
     fp16: bool = True,
     label_smoothing: float = 0.0,
+    group_by_length: bool = False,
 ) -> TrainingArguments:
     # transformers 把 evaluation_strategy 改名成 eval_strategy 過；Kaggle Notebook 內建的
     # 版本不固定，用 inspect 挑對的參數名比硬編一個更穩。
@@ -163,6 +164,11 @@ def _training_args(
         # HF 的 LabelSmoother 會在算 cross entropy 時自動把目標機率從 1.0 壓低、
         # 分一點出去給另外兩類。0.0 等於關閉，行為跟原本完全一樣。
         label_smoothing_factor=label_smoothing,
+        # 把長度相近的樣本分到同一個 batch，減少 padding 浪費的算力。PreferenceDataset
+        # 不是 datasets.Dataset，Trainer 會退回自己對每一筆呼叫 len(item["input_ids"])
+        # 來排序（PreferenceDataset.__getitem__ 回傳的就是這個 key，天生相容，不用額外
+        # 接一個 length 欄位）。風險見 train_fold() 的 group_by_length 說明。
+        group_by_length=group_by_length,
         report_to=[],
         logging_steps=10 if max_steps else 50,
         # 關掉 tqdm 進度條、強制用純文字 print 記錄 loss —— Kaggle Notebook 預設會用
@@ -218,6 +224,7 @@ def train_fold(
     eval_steps: int | None = None,
     eval_subset_rows: int | None = None,
     label_smoothing: float = 0.0,
+    group_by_length: bool = False,
 ) -> dict:
     """練一個 fold，存權重，回傳 {"score", "n_nonfinite", "diverged", "output_dir",
     "trainer", "tokenizer"}。
@@ -239,7 +246,15 @@ def train_fold(
     的分數，不會被子集的雜訊污染。
 
     `label_smoothing`（milestone 3）：0.0 是關閉，跟原本行為一樣；HF Trainer 內建
-    支援，不用自己改 labels 或 loss function。
+    支援，不用自己改 labels 或 loss function。實測 0.1 讓 fold 0 valid log loss
+    從 1.06840 變差成 1.08815，已經放棄，不要再試（見 README.md）。
+
+    `group_by_length`：把長度相近的樣本分到同一個 batch，減少 padding 浪費。
+    False 是關閉，跟原本行為一樣。風險：這正好會把最長的句子集中到同一批，獨立的
+    profiling kernel 已經測過最壞情況（fold 0 最長 16 筆組成一個 batch）單步
+    forward+backward 不會 OOM（餘裕 23.6%），但那是單步測試，完整一個 epoch 訓練
+    下來記憶體碎片化累積會不會更緊繃還沒驗證過，第一次用這個設定時不要跳過
+    `diverged`/`n_nonfinite` 的檢查。
 
     `batch_size` 調大要非常小心：煙霧測試只能驗證穩定性（會不會發散），驗不出「完整
     資料集上的記憶體上限」——`max_train_rows` 抽樣的子集很難剛好抽到全是接近
@@ -296,7 +311,7 @@ def train_fold(
         args=_training_args(
             output_dir, epochs, batch_size, lr, lr_scheduler_type=lr_scheduler_type,
             max_steps=max_steps, eval_steps=eval_steps, fp16=fp16,
-            label_smoothing=label_smoothing,
+            label_smoothing=label_smoothing, group_by_length=group_by_length,
         ),
         train_dataset=tr_ds,
         eval_dataset=va_ds_periodic,

@@ -100,6 +100,52 @@ print("煙霧測試通過，加速設定沒有引入不穩定")
 # 對調增強、`winner_tie` 特殊處理。
 
 # %% [markdown]
+# ## `group_by_length` 實驗（訓練效能，先只在 fold 0 驗證，不直接動全部 5 folds）
+#
+# 白話說：把長度相近的樣本分到同一個 batch，減少「短句子被迫填充到跟長句子一樣長」
+# 浪費掉的算力。獨立的 profiling kernel（`profile_train.py`）已經用真的 GPU 測過
+# 最壞情況——把 fold 0 訓練集裡最長的 16 筆組成一個 batch，單步 forward+backward
+# 沒有 OOM（記憶體餘裕 23.6%）。但那只驗證了「單一步驟不會炸」，這裡要驗證的是
+# 完整一個 fold（2 epochs、45746 列）訓練下來：(1) 真的省了多少時間、(2) 分數
+# 有沒有意外變差（理論上不該變差——只是改批次組成跟順序，模型看到的資料一樣多）、
+# (3) 記憶體有沒有在長時間訓練後因為碎片化而撐不住（單步測試驗不出這個）。
+#
+# 比較基準：fold 0 目前（沒有 group_by_length）的訓練總耗時 6051 秒（約 1.68 小時）、
+# valid log loss 1.06840。output_dir 跟主要的 5-fold 訓練分開，不會互相干擾，也
+# 不會被下面的「跳過已存在權重」邏輯誤判成同一份。
+
+# %%
+import time as _time
+
+FOLD0_BASELINE_SECONDS = 6051
+FOLD0_BASELINE_LOG_LOSS = 1.06840
+
+_t0 = _time.time()
+gbl_result = train_fold(
+    fold=0, epochs=2, batch_size=8, max_len=512, lr=2e-5,
+    fp16=True, eval_steps=1500, eval_subset_rows=2000,
+    group_by_length=True,
+    output_dir="/kaggle/working/model/_group_by_length_fold0",
+)
+gbl_seconds = _time.time() - _t0
+print(f"fold 0（group_by_length=True）訓練總耗時：{gbl_seconds:.0f}s（基準 {FOLD0_BASELINE_SECONDS}s，"
+      f"{'省下' if gbl_seconds < FOLD0_BASELINE_SECONDS else '多花'} {abs(FOLD0_BASELINE_SECONDS - gbl_seconds):.0f}s，"
+      f"{(FOLD0_BASELINE_SECONDS - gbl_seconds) / FOLD0_BASELINE_SECONDS * 100:+.1f}%）")
+print(f"fold 0（group_by_length=True）valid log loss: {gbl_result['score']:.5f}")
+print(f"fold 0 基準（無 group_by_length）: {FOLD0_BASELINE_LOG_LOSS:.5f}")
+print(f"分數差異：{FOLD0_BASELINE_LOG_LOSS - gbl_result['score']:+.5f}（接近 0 才正常，明顯變差代表這個設定有問題）")
+assert not gbl_result["diverged"] and gbl_result["n_nonfinite"] == 0, (
+    "group_by_length 訓練發散或有非有限值（可能是長時間訓練下記憶體/數值比 profiling "
+    "kernel 單步測試更緊繃），不要拿這個結果做決定，也不要直接套進下面的主要訓練迴圈"
+)
+
+# %% [markdown]
+# **決定要不要繼續**：如果上面沒有發散、分數沒有明顯變差（在雜訊量級 0.003 以內）、
+# 而且時間確實省下來了，值得把下面主要訓練迴圈的 5 個 `train_fold()` 呼叫都加上
+# `group_by_length=True`。如果發散、OOM、或分數明顯變差，放棄這個設定，`train_fold()`
+# 的 `group_by_length` 參數維持預設 False 不動。
+
+# %% [markdown]
 # 煙霧測試過關後才跑完整訓練。valid log loss 必須小於 1.09861（ln 3）—— 這是本專案
 # 判斷分數的唯一標準，也是 scripts/baseline_prior.py 在真實資料上印出的基準
 # （1.09723）。步進式存檔（每 1500 步）跟發散偵測保護都還在，不會再白燒一整個
