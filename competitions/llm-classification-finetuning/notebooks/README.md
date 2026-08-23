@@ -74,6 +74,25 @@ kaggle kernels status jameslin45/llm-classification-profile-training
 kaggle kernels output jameslin45/llm-classification-profile-training -p outputs/profile_kernel_output
 ```
 
+還有一個**fold 4 補練** kernel（`train_fold4.py` / `train_fold4_kernel/`）——`train_kernel`
+這幾次為了做實驗 push 的精簡版 notebook，每次跑完都會把它在 Kaggle 上的輸出整個換掉，
+導致正式使用的 fold 0-4 權重已經抓不回來了（fold 0-3 還有安全網，見下面；fold 4
+沒有）。這個 kernel 完全獨立、不掛 `train_kernel` 的 `kernel_sources`，用跟原本
+fold 4 一樣的設定重新練一次，練完攤平成 `fold4__<檔名>` 格式，方便跟 fold 0-3
+合併成一個涵蓋全部 5 folds 的新 Dataset（不要再依賴任何 kernel 的「最新輸出」，
+避免同樣的事再發生一次）：
+
+```bash
+kaggle kernels push -p notebooks/train_fold4_kernel
+kaggle kernels status jameslin45/llm-classification-train-fold-4-checkpoint
+kaggle kernels output jameslin45/llm-classification-train-fold-4-checkpoint -p outputs/train_fold4_output
+```
+
+**注意**：這個 kernel 的 title 不能隨便取——實測 Kaggle 現在會直接拒絕「title
+轉出來的 slug」跟 `kernel-metadata.json` 裡的 `id` 對不起來的 push（`400 Bad
+Request`），不再是之前那種「不管你的 id、直接改用 title 轉出來的值」的沉默行為，
+push 之前 title 要能乾淨轉成你要的 id。
+
 ## 手動貼到 Kaggle 網頁（備用）
 
 不想用 CLI 的話，把 `train_deberta.py` / `infer_deberta.py` 每個 `# %%` 區塊貼成

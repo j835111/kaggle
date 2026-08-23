@@ -106,6 +106,7 @@ def main() -> int:
     build_one(NOTEBOOKS_DIR / "infer_deberta.py", NOTEBOOKS_DIR / "infer_kernel" / "infer_deberta.ipynb")
     build_one(NOTEBOOKS_DIR / "calibrate_folds.py", NOTEBOOKS_DIR / "calibrate_kernel" / "calibrate_folds.ipynb")
     build_one(NOTEBOOKS_DIR / "profile_train.py", NOTEBOOKS_DIR / "profile_kernel" / "profile_train.ipynb")
+    build_one(NOTEBOOKS_DIR / "train_fold4.py", NOTEBOOKS_DIR / "train_fold4_kernel" / "train_fold4.ipynb")
     return 0
 
 
