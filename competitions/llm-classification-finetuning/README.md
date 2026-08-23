@@ -213,10 +213,33 @@ batch 的梯度震幅更劇烈，更容易踩到 fp16 數值溢位。訓練被�
 或更差。結論：**放棄**，`train_fold()` 的 `group_by_length` 參數留著（預設
 False，行為不變）。
 
-**下一步**：milestone 3 剩下訓練時 a/b 對調增強、`winner_tie` 特殊處理還沒開始；
-訓練效能這條線目前評估過的候選手法（sdpa、group_by_length、dataloader 調整）
-全部放棄或無效，`torch.compile()` 因為 DeBERTa 自訂運算容易觸發頻繁重新編譯，
-評估認為優先度太低沒有試。
+**修復 fold 4 遺失、備份完整 5-fold Dataset**：上面幾次為了做實驗 push 的精簡版
+`train_kernel`（冒煙測試 + 單一實驗，拿掉主要 5-fold 訓練），每次成功跑完都會把
+`train_kernel` 在 Kaggle 上的輸出整個換掉；正式使用的 fold 0-4 權重（送出 1.04529
+那份）因此不再能透過 `kernel_sources` 抓回來——fold 0-3 還有安全網（獨立的
+`fold0-3-checkpoints` Dataset），fold 4 完全遺失。用獨立的 `train_fold4_kernel`
+（不掛 `train_kernel` 的 `kernel_sources`）補練了一次 fold 4，跟 fold 0-3 合併成
+新的 `fold0-4-checkpoints` Dataset（涵蓋全部 5 folds，永久保存，不受任何 kernel
+之後的 push 影響），`train_kernel/kernel-metadata.json` 的 `dataset_sources` 也
+改指到這個新 Dataset。
+
+補練 fold 4 這次意外挖出一個更根本的問題：**同一個 fold、完全相同的設定重跑一次，
+valid log loss 從 1.05712 飄動到 1.07493（+0.01781），且沒有發散**。追查發現
+`AutoModelForSequenceClassification.from_pretrained()`（隨機初始化新的分類頭）
+是在 `Trainer` 建立、`TrainingArguments(seed=42)` 生效**之前**執行的——那個 seed
+從來沒真正固定住分類頭的起始值，只固定了訓練過程（資料洗牌、dropout）的隨機性。
+這代表**label smoothing 判定「變差 0.01975」、group_by_length 那次比較，都可能
+有一部分（甚至大部分）只是分類頭初始值不同造成的隨機波動，不是那個手法真的有害**。
+`train_fold()` 已經修正（`from_pretrained()` 之前先呼叫 `set_seed()`），label
+smoothing 用修好的版本重新做了一次同一個 kernel 執行內的 baseline vs
+`label_smoothing=0.1` 控制實驗（兩邊分類頭起始值保證一致），已 push 上 Kaggle
+（train_kernel version 19）——結果還沒回來。group_by_length 的發散結論維持，
+但信心度較低，還沒有用修好的版本重新驗證過。
+
+**下一步**：等 label smoothing 的控制實驗結果回來，milestone 3 剩下訓練時 a/b
+對調增強、`winner_tie` 特殊處理還沒開始；訓練效能這條線目前評估過的候選手法
+（sdpa、group_by_length、dataloader 調整）全部放棄或無效，`torch.compile()`
+因為 DeBERTa 自訂運算容易觸發頻繁重新編譯，評估認為優先度太低沒有試。
 
 ## 路線圖
 
@@ -226,7 +249,10 @@ False，行為不變）。
 - [x] 里程碑 2：DeBERTa-v3-base 三分類微調，fold 0 跑出 valid log loss 1.08494，
       優於基準，已送出排行榜 143/212。訓練加速後單一 fold 約 1.7 小時（原本
       將近 9 小時）。**5 folds 已全部練完**（1.06840 / 1.05461 / 1.07391 /
-      1.08028 / 1.05712，全數優於基準）。
+      1.08028 / 1.05712，全數優於基準）。**fold 4 後來因為 Kaggle 輸出被實驗
+      push 蓋掉而遺失，補練一次分數變成 1.07493**（同一份設定重跑就飄動 0.0178，
+      見下面 seed 漏洞的說明）——目前 `fold0-4-checkpoints` Dataset 裡的 fold 4
+      是這個補練版本，跟送出 1.04529 排行榜那次用的不是同一份權重，但都優於基準。
 - [ ] 里程碑 3：加上已知有效的手法
   - [x] a/b 對調 TTA + temperature scaling：5 folds 各自驗證，5/5 都有改善
         （平均 +0.00836），已套進 `infer_deberta.py`（fold 0 + T=1.238），
