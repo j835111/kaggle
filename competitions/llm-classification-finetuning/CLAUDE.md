@@ -33,12 +33,14 @@
 這個 `dataset_sources` 清空**，重練完務必比照這次的做法，把輸出打包成新的
 Dataset 更新掉舊的，不要只依賴 kernel 的輸出。
 
-`infer_kernel`/`calibrate_kernel` 目前還是用 `kernel_sources` 接 `train_kernel`
-的輸出，不是直接接這個 Dataset——只要 `train_kernel` 之後的 push 都是完整跑主要
-5-fold 迴圈（不是精簡版實驗），迴圈會全部從 Dataset 複製回來，`train_kernel` 的
-輸出仍然正確，鏈路沒斷。但如果又像這次一樣 push 精簡版實驗、跳過主迴圈，
-`infer_kernel`/`calibrate_kernel` 抓到的又會是不完整的權重——這是還沒補的
-根本修法（改成直接 `dataset_sources` 接 Dataset，不透過 `kernel_sources`）。
+**這個根本修法已經補上**：`infer_kernel`/`calibrate_kernel` 原本用 `kernel_sources`
+接 `train_kernel` 的輸出，只要 `train_kernel` 之後 push 的是精簡版實驗（跳過主
+5-fold 迴圈，例如 label smoothing 那次的 version 19），這兩個 kernel 抓到的就會是
+不完整的權重。已改成兩者的 `dataset_sources` 都直接指到 `fold0-4-checkpoints`，
+不再透過 `kernel_sources` 繞道 `train_kernel`。因為 Dataset 裡的檔名是攤平的
+`fold{N}__檔名`（不是巢狀 `fold{N}/檔名`），`infer_deberta.py`/`calibrate_folds.py`
+的 checkpoint 發現 cell 也比照 `train_deberta.py` 的做法，先把攤平檔名還原成
+巢狀資料夾（複製到 `MODEL_DIR/fold{N}/`）才讓 `from_pretrained()` 讀。
 
 ## `train_fold()` 的分類頭初始化，`TrainingArguments(seed=42)` 固定不住
 
