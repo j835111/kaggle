@@ -195,24 +195,28 @@ TTA + 各自的校準溫度，5 組機率取平均）push 上 Kaggle 跑通、�
 參數留著（預設 0.0，不影響現有行為），但 `train_deberta.py` 裡測試用的 cell
 已經拿掉，不會再浪費 GPU 時間重跑。
 
-**訓練效能評估**（純研究，還沒真的套用）：DeBERTa-v3 的相對位置注意力機制不支援
-`attn_implementation="sdpa"`——實測會直接報錯（`DebertaV2ForSequenceClassification
-does not support ...`，對應 HF issue #28005，官方還沒補），這條路徹底放棄。
+**訓練效能評估**：`attn_implementation="sdpa"` 對 DeBERTa-v3 不支援，實測直接
+報錯（`DebertaV2ForSequenceClassification does not support ...`，對應 HF issue
+#28005，官方還沒補），放棄。`torch.profiler` 量過 15 步的時間分佈：耗最多 CUDA
+時間的是 `aten::bmm`／`aten::linear`／`aten::gather_backward`／`aten::scatter_add_`
+這類模型計算本身的運算（後兩者是 DeBERTa 相對位置編碼反向傳播），不是資料載入或
+tokenize，`num_workers`/`pin_memory` 這類 dataloader 調整不會有明顯幫助。
+
 `group_by_length=True`（把長度相近的樣本分到同一個 batch，減少 padding 浪費）
-原本擔心的風險是：這正好會主動把最長的句子集中到同一個 batch，而 batch_size=16
-在完整資料集上曾經因為「某一批全是長句子」只差 66MB 就 CUDA OOM。實測抓出 fold 0
-訓練集裡最長的 16 筆（fold 0 有 8.11% 的列打滿 max_len=512）組成最壞情況的一個
-batch，真的跑一次 forward+backward：**peak memory 11.122 GiB / 總量 14.562 GiB，
-餘裕 3.44 GiB（約 23.6%）**——比原本擔心的風險小很多，值得找時間實際跑一次完整
-fold 驗證有沒有用（單步測試沒炸不等於一整個 epoch 訓練下來、記憶體碎片化累積後
-也不會炸，仍需要完整訓練驗證）。另外用 `torch.profiler` 量過 15 步的時間分佈：
-耗最多 CUDA 時間的是 `aten::bmm`／`aten::linear`／`aten::gather_backward`／
-`aten::scatter_add_` 這類模型計算本身的運算（後兩者是 DeBERTa 相對位置編碼反向
-傳播），不是資料載入或 tokenize，確認 `num_workers`/`pin_memory` 這類 dataloader
-調整不會有明顯幫助。
+單步記憶體壓力測試（最長 16 筆組成最壞 batch）沒有 OOM（餘裕 23.6%），但**完整
+fold 實測失敗**：訓練在 epoch 0.4809（原訂 2 epochs，只跑了 24%）就因為 `grad_norm`
+變成 `inf` 被 `StopOnNonFiniteLoss` 攔截停止——跟這個模型已知在 fp32/peak LR 附近
+容易發散是同一類問題，推測 `group_by_length` 把長句子集中到同一個 batch 讓某些
+batch 的梯度震幅更劇烈，更容易踩到 fp16 數值溢位。訓練被攔停之後印出的「耗時
+1256s（比基準快 79%）」「valid log loss 1.09921（比基準差 0.03081）」**兩個數字
+都不是有效比較**——是訓練只跑了四分之一被緊急煞車，不是 group_by_length 真的更快
+或更差。結論：**放棄**，`train_fold()` 的 `group_by_length` 參數留著（預設
+False，行為不變）。
 
 **下一步**：milestone 3 剩下訓練時 a/b 對調增強、`winner_tie` 特殊處理還沒開始；
-效能這邊 `group_by_length=True` 值得找時間實際上一次完整 fold 訓練驗證。
+訓練效能這條線目前評估過的候選手法（sdpa、group_by_length、dataloader 調整）
+全部放棄或無效，`torch.compile()` 因為 DeBERTa 自訂運算容易觸發頻繁重新編譯，
+評估認為優先度太低沒有試。
 
 ## 路線圖
 
@@ -233,10 +237,10 @@ fold 驗證有沒有用（單步測試沒炸不等於一整個 epoch 訓練下�
         1.08815，比基準 1.06840 變差 0.01975（雜訊量級的 7 倍）——**放棄**
   - [ ] a/b 對調當「訓練時」的資料增強（目前只做了推論時的 TTA，訓練資料還沒加這個增強）
   - [ ] 針對 `winner_tie` 這一類的處理（通常是最難、也是 loss 的主要來源）
-  - [ ] 訓練效能：`group_by_length=True` 最壞情況記憶體壓力測試已通過（餘裕
-        23.6%，比原本擔心的風險小很多），還沒實際跑一次完整 fold 驗證時間省多少、
-        分數有沒有受影響。`attn_implementation="sdpa"` 已確認不支援（HF issue
-        #28005），放棄。
+  - [x] 訓練效能：`attn_implementation="sdpa"` 不支援（HF issue #28005）、
+        `group_by_length=True` 完整 fold 實測在 epoch 0.4809 就發散（grad_norm
+        變 inf）、dataloader 調整經 profiling 確認沒有幫助——三個候選手法**全部
+        放棄**，`torch.compile()` 評估後判斷優先度太低沒有試
 - [ ] 里程碑 4：換更大的模型 + LoRA + 4bit 量化（需要自有 GPU 或雲端 GPU）
 
 ## 參考
