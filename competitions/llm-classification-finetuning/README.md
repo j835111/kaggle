@@ -184,11 +184,16 @@ Trainer 自己 `save_steps` 存的 `checkpoint-*/`（含 optimizer/scheduler sta
 **5-fold 機率平均 ensemble 已送出排行榜**：`infer_deberta.py`（每個 fold 各自
 TTA + 各自的校準溫度，5 組機率取平均）push 上 Kaggle 跑通、送出排行榜：
 **public score 1.04529**（上一版單 fold + TTA + 校準是 1.05159，改善 +0.0063）。
-5 個 fold 的機率平均确实比單一 fold 更好，不是雜訊。
+5 個 fold 的機率平均確實比單一 fold 更好，不是雜訊。
 
-**下一步**：milestone 3 剩下三項都還沒開始——label smoothing、訓練時 a/b 對調
-增強、`winner_tie` 特殊處理，這三項都需要重新訓練（會動到 `train.py` / 資料組裝，
-不像 TTA/校準/ensemble 那樣只改推論端）。
+**下一步**：`llmcls/train.py` 的 `train_fold()` / `_training_args()` 已經加上
+`label_smoothing` 參數（HF Trainer 內建支援，labels 不用先轉成 one-hot），
+`train_deberta.py` 加了一個獨立的實驗 cell——只在 fold 0 上跑
+`label_smoothing=0.1`（output_dir 跟主要的 5-fold 訓練分開，不會互相干擾），
+跟 fold 0 基準 1.06840 比較。**還沒 push 上 Kaggle 跑**，只有程式碼跟本機 33 項
+測試通過（`train.py` 本身不能本機測，需要 torch/transformers）。跑完這個實驗才
+知道要不要把全部 5 folds 重新訓練一次套上這個設定。milestone 3 剩下的訓練時 a/b
+對調增強、`winner_tie` 特殊處理則還沒開始。
 
 ## 路線圖
 
@@ -205,7 +210,8 @@ TTA + 各自的校準溫度，5 組機率取平均）push 上 Kaggle 跑通、�
         已送出排行榜：public score 1.05159（milestone 2 為 1.07748）
   - [x] 5-fold 機率平均 ensemble：`infer_deberta.py` push 上 Kaggle 送排行榜，
         public score 1.04529（單 fold + TTA + 校準是 1.05159）
-  - [ ] label smoothing（需要重新訓練，還沒做）
+  - [ ] label smoothing：`train_fold()` 已支援，`train_deberta.py` 加了 fold 0
+        獨立實驗 cell（vs 基準 1.06840），還沒 push 上 Kaggle 跑
   - [ ] a/b 對調當「訓練時」的資料增強（目前只做了推論時的 TTA，訓練資料還沒加這個增強）
   - [ ] 針對 `winner_tie` 這一類的處理（通常是最難、也是 loss 的主要來源）
 - [ ] 里程碑 4：換更大的模型 + LoRA + 4bit 量化（需要自有 GPU 或雲端 GPU）

@@ -121,6 +121,7 @@ def _training_args(
     max_steps: int | None = None,
     eval_steps: int | None = None,
     fp16: bool = True,
+    label_smoothing: float = 0.0,
 ) -> TrainingArguments:
     # transformers 把 evaluation_strategy 改名成 eval_strategy 過；Kaggle Notebook 內建的
     # 版本不固定，用 inspect 挑對的參數名比硬編一個更穩。
@@ -158,6 +159,10 @@ def _training_args(
         # StopOnNonFiniteLoss 則是最後一道防線。T4 有 fp16 tensor core，這樣才吃得到
         # 混合精度的加速。
         fp16=fp16,
+        # Trainer 內建的 label smoothing：labels 還是整數類別（不用先轉成 one-hot），
+        # HF 的 LabelSmoother 會在算 cross entropy 時自動把目標機率從 1.0 壓低、
+        # 分一點出去給另外兩類。0.0 等於關閉，行為跟原本完全一樣。
+        label_smoothing_factor=label_smoothing,
         report_to=[],
         logging_steps=10 if max_steps else 50,
         # 關掉 tqdm 進度條、強制用純文字 print 記錄 loss —— Kaggle Notebook 預設會用
@@ -212,6 +217,7 @@ def train_fold(
     max_steps: int | None = None,
     eval_steps: int | None = None,
     eval_subset_rows: int | None = None,
+    label_smoothing: float = 0.0,
 ) -> dict:
     """練一個 fold，存權重，回傳 {"score", "n_nonfinite", "diverged", "output_dir",
     "trainer", "tokenizer"}。
@@ -231,6 +237,9 @@ def train_fold(
     （原本每次評估都對完整驗證集跑一次，實測光是評估就佔掉總訓練時間近一半），最後
     收斂完仍然會對完整驗證集重新 `evaluate()` 一次，回傳的 `score` 保證是完整驗證集
     的分數，不會被子集的雜訊污染。
+
+    `label_smoothing`（milestone 3）：0.0 是關閉，跟原本行為一樣；HF Trainer 內建
+    支援，不用自己改 labels 或 loss function。
 
     `batch_size` 調大要非常小心：煙霧測試只能驗證穩定性（會不會發散），驗不出「完整
     資料集上的記憶體上限」——`max_train_rows` 抽樣的子集很難剛好抽到全是接近
@@ -287,6 +296,7 @@ def train_fold(
         args=_training_args(
             output_dir, epochs, batch_size, lr, lr_scheduler_type=lr_scheduler_type,
             max_steps=max_steps, eval_steps=eval_steps, fp16=fp16,
+            label_smoothing=label_smoothing,
         ),
         train_dataset=tr_ds,
         eval_dataset=va_ds_periodic,
