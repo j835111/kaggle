@@ -27,6 +27,7 @@ from transformers import (
     Trainer,
     TrainerCallback,
     TrainingArguments,
+    set_seed,
 )
 
 from llmcls.config import MAX_LEN, MODEL_DIR, MODEL_NAME, N_CLASSES, N_FOLDS, SEED
@@ -279,6 +280,14 @@ def train_fold(
     print(f"fold {fold}: train {len(tr_idx)} 列, valid {len(va_idx)} 列")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # 分類頭（deberta-v3-base 本身沒有，from_pretrained 會隨機初始化一層新的）是在
+    # Trainer 建立、TrainingArguments(seed=...) 生效之前就跑掉的——實測同一個 fold
+    # 用完全相同的設定重跑，valid log loss 可以飄動 0.01~0.02（跟 label smoothing/
+    # group_by_length 那兩次判定「有害」的差距同一個量級），才發現這裡才是真正決定
+    # 起始點隨機性的地方，TrainingArguments 的 seed 只固定得了訓練「過程」（資料
+    # 洗牌順序、dropout），固定不了「起點」。這裡先呼叫 set_seed() 才能讓同一個
+    # seed 重跑兩次得到同一個分類頭初始值，A/B 比較才有意義。
+    set_seed(SEED)
     model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=N_CLASSES)
     # 實測 deberta-v3-base 在 HF Hub 上是用 fp16 存的，新版 transformers 的
     # from_pretrained 預設照抄 checkpoint 原本的 dtype，跟 TrainingArguments(fp16=False)

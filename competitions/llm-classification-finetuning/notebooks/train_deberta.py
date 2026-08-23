@@ -87,15 +87,48 @@ assert not smoke["diverged"] and smoke["n_nonfinite"] == 0, (
 print("煙霧測試通過，加速設定沒有引入不穩定")
 
 # %% [markdown]
-# ## Label smoothing 實驗（milestone 3，已測完，結論：放棄）
+# ## Label smoothing 實驗（milestone 3，重新做一次——第一次測的方法有漏洞）
 #
-# 在 fold 0 單獨測過 `label_smoothing=0.1`（output_dir 跟主要 5-fold 訓練分開，
-# 不影響正式權重）：valid log loss 1.08815，比基準 1.06840 **變差 0.01975**——是
-# TTA/校準實驗量到的雜訊量級（標準差 0.00288）的將近 7 倍，不是雜訊。放鬆訓練目標
-# 的信心，讓模型在本來能有把握答對的題目上也不敢預測太肯定，log loss 對「答對但
-# 不夠肯定」的懲罰蓋過了「答錯但太肯定」省下來的懲罰。結論：**不要用**，`train_fold()`
-# 的 `label_smoothing` 參數留著（預設 0.0，行為不變），但不再需要重跑這個實驗。
+# **第一次測的問題**：在補練 fold 4 的時候發現，`train_fold()` 原本在載入模型
+# （`AutoModelForSequenceClassification.from_pretrained()`，分類頭是隨機初始化的
+# 新的一層）之後才建立 `Trainer`、`TrainingArguments(seed=42)` 才生效——分類頭的
+# 起始隨機值從來沒被這個 seed 固定住。實測同一個 fold、完全相同設定重跑一次，valid
+# log loss 可以飄動 0.01~0.02，跟第一次判定 label smoothing 「變差 0.01975」是同一
+# 個量級——那次比較的兩個分數來自不同時間跑的兩次訓練，分類頭起始值本來就不一樣，
+# 差距有可能大部分只是隨機運氣，不是 label smoothing 真的有害。已經在 `train_fold()`
+# 裡加了 `set_seed(SEED)`（在載入模型之前呼叫），現在同一個 seed 重跑會拿到同一個
+# 分類頭起始值。
 #
+# **這次重做**：baseline 跟 `label_smoothing=0.1` 都在**同一次 kernel 執行**裡各自
+# 呼叫一次 `train_fold()`——兩次呼叫各自呼叫到的 `set_seed(SEED)` 保證兩邊的分類頭
+# 起始值一致，才是真正公平的 A/B 比較，不再跟舊 session 的歷史數字比較。output_dir
+# 都跟主要 5-fold 訓練分開，不影響正式權重。
+
+# %%
+ab_baseline = train_fold(
+    fold=0, epochs=2, batch_size=8, max_len=512, lr=2e-5,
+    fp16=True, eval_steps=1500, eval_subset_rows=2000,
+    output_dir="/kaggle/working/model/_seed_fixed_baseline_fold0",
+)
+print(f"baseline（無 label smoothing）valid log loss: {ab_baseline['score']:.5f}")
+assert not ab_baseline["diverged"] and ab_baseline["n_nonfinite"] == 0, (
+    "baseline 重跑就發散了，seeding 修法本身可能有問題，先不要信下面的比較"
+)
+
+ab_label_smoothing = train_fold(
+    fold=0, epochs=2, batch_size=8, max_len=512, lr=2e-5,
+    fp16=True, eval_steps=1500, eval_subset_rows=2000,
+    label_smoothing=0.1,
+    output_dir="/kaggle/working/model/_seed_fixed_label_smoothing_fold0",
+)
+print(f"label_smoothing=0.1 valid log loss: {ab_label_smoothing['score']:.5f}")
+assert not ab_label_smoothing["diverged"] and ab_label_smoothing["n_nonfinite"] == 0, (
+    "label smoothing 訓練發散或有非有限值，不要拿這個結果做決定"
+)
+
+print(f"差異：{ab_baseline['score'] - ab_label_smoothing['score']:+.5f}（正值代表 label smoothing 有幫助）")
+
+# %% [markdown]
 # 詳細數字見 README.md「目前狀態」段落。milestone 3 剩下的候選手法：訓練時 a/b
 # 對調增強、`winner_tie` 特殊處理。
 
@@ -115,6 +148,13 @@ print("煙霧測試通過，加速設定沒有引入不穩定")
 # 訓練只跑了四分之一就被緊急煞車攔下來；分數變差也是因為模型根本沒練完，不是
 # group_by_length 本身讓分數變爛。判斷一個訓練實驗有沒有意義，第一步永遠是先確認
 # `diverged=False`，時間和分數的比較才有意義。
+#
+# **註記**：這次測試是在發現分類頭初始化沒被 seed 固定（見上面 label smoothing
+# 那段）之前做的，理論上不同的隨機初始值也可能影響訓練在哪個點對梯度爆炸比較敏感。
+# 但這裡是**直接發散**（grad_norm 變 inf），不是「分數飄動 0.01~0.02」這種量級的
+# 問題，用不同初始值再測一次也未必會每次都發散，但發散本身仍然是一個真實訊號，不是
+# 憑空捏造的——只是還沒有用修好 seeding 的版本重新驗證過，結論維持放棄，但信心
+# 沒有 label smoothing 那次（已經重測過）那麼高。
 #
 # 結論：**不要用**，`train_fold()` 的 `group_by_length` 參數留著（預設 False，
 # 行為不變）。要讓它可用可能需要額外調低 peak LR 或拉長 warmup，但這是額外的調參
