@@ -62,6 +62,18 @@ kaggle kernels output jameslin45/llm-classification-calibrate-deberta-all-folds 
 `kernel_sources` 跟 `infer_kernel` 一樣接訓練 kernel 的輸出、`enable_internet: false`
 ——只是讀本地權重量測分數，不用連網路。
 
+還有一個**訓練效能量測** kernel（`profile_train.py` / `profile_kernel/`）——不掛任何
+舊 checkpoint、用乾淨的 base model，量測 `group_by_length` 最壞情況（fold 0 訓練集
+最長的 16 筆組成一個 batch）會不會 CUDA OOM，以及 `attn_implementation="sdpa"`
+支不支援、速度差多少。不存權重、不產生 submission，跟 `train_kernel` 完全獨立
+（不同 slug），push 這個不會影響正在跑的訓練 kernel：
+
+```bash
+kaggle kernels push -p notebooks/profile_kernel
+kaggle kernels status jameslin45/llm-classification-profile-training
+kaggle kernels output jameslin45/llm-classification-profile-training -p outputs/profile_kernel_output
+```
+
 ## 手動貼到 Kaggle 網頁（備用）
 
 不想用 CLI 的話，把 `train_deberta.py` / `infer_deberta.py` 每個 `# %%` 區塊貼成

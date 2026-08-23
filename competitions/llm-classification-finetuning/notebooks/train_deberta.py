@@ -87,42 +87,17 @@ assert not smoke["diverged"] and smoke["n_nonfinite"] == 0, (
 print("煙霧測試通過，加速設定沒有引入不穩定")
 
 # %% [markdown]
-# ## Label smoothing 實驗（milestone 3，先只在 fold 0 驗證，不直接動全部 5 folds）
+# ## Label smoothing 實驗（milestone 3，已測完，結論：放棄）
 #
-# 白話說：訓練時原本要求模型對正確答案喊到 100% 確定，`label_smoothing=0.1` 把這個
-# 目標調鬆成 90%、剩下 10% 分給另外兩類。log loss 對「很有信心但答錯」罰得特別重，
-# 放鬆信心通常直接有幫助。
+# 在 fold 0 單獨測過 `label_smoothing=0.1`（output_dir 跟主要 5-fold 訓練分開，
+# 不影響正式權重）：valid log loss 1.08815，比基準 1.06840 **變差 0.01975**——是
+# TTA/校準實驗量到的雜訊量級（標準差 0.00288）的將近 7 倍，不是雜訊。放鬆訓練目標
+# 的信心，讓模型在本來能有把握答對的題目上也不敢預測太肯定，log loss 對「答對但
+# 不夠肯定」的懲罰蓋過了「答錯但太肯定」省下來的懲罰。結論：**不要用**，`train_fold()`
+# 的 `label_smoothing` 參數留著（預設 0.0，行為不變），但不再需要重跑這個實驗。
 #
-# 這個改動要重新訓練（不像 TTA/校準/ensemble 只改推論端就能後補），所以先只在
-# fold 0 花一次訓練時間（約 1.7 小時）驗證有沒有用，output_dir 跟主要的 5-fold
-# 訓練分開，不會互相干擾，也不會被下面的「跳過已存在權重」邏輯誤判成同一份。
-# 確認有用才決定要不要把全部 5 folds 重練一次套上這個設定。
-#
-# 比較基準：fold 0 目前（無 label smoothing）的 valid log loss 是 1.06840（下面
-# 5-fold 訓練表格那一列）。TTA+校準那次實驗量到的 fold 間標準差是 0.00288——下面
-# 這個分數至少要比 1.06840 好超過這個雜訊量級，才算是真的有幫助，不是雜訊。
-
-# %%
-FOLD0_BASELINE_NO_LABEL_SMOOTHING = 1.06840
-
-ls_result = train_fold(
-    fold=0, epochs=2, batch_size=8, max_len=512, lr=2e-5,
-    fp16=True, eval_steps=1500, eval_subset_rows=2000,
-    label_smoothing=0.1,
-    output_dir="/kaggle/working/model/_label_smoothing_fold0",
-)
-print(f"fold 0（label_smoothing=0.1）valid log loss: {ls_result['score']:.5f}")
-print(f"fold 0 基準（無 label smoothing）: {FOLD0_BASELINE_NO_LABEL_SMOOTHING:.5f}")
-print(f"差異：{FOLD0_BASELINE_NO_LABEL_SMOOTHING - ls_result['score']:+.5f}（正值代表 label smoothing 有幫助）")
-assert not ls_result["diverged"] and ls_result["n_nonfinite"] == 0, (
-    "label smoothing 訓練發散或有非有限值，不要拿這個結果做決定"
-)
-
-# %% [markdown]
-# **決定要不要繼續**：如果上面的差異明顯大於 0.003（TTA/校準實驗量到的雜訊量級），
-# 值得把全部 5 folds 重新訓練一次、套上 `label_smoothing=0.1`（把下面主要訓練迴圈
-# 的 `train_fold(...)` 呼叫加上這個參數即可）。如果差異在雜訊範圍內或更差，放棄這條
-# 路，去做 milestone 3 剩下的其他項目（訓練時 a/b 對調增強、`winner_tie` 特殊處理）。
+# 詳細數字見 README.md「目前狀態」段落。milestone 3 剩下的候選手法：訓練時 a/b
+# 對調增強、`winner_tie` 特殊處理。
 
 # %% [markdown]
 # 煙霧測試過關後才跑完整訓練。valid log loss 必須小於 1.09861（ln 3）—— 這是本專案

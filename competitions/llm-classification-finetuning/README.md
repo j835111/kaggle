@@ -186,14 +186,33 @@ TTA + 各自的校準溫度，5 組機率取平均）push 上 Kaggle 跑通、�
 **public score 1.04529**（上一版單 fold + TTA + 校準是 1.05159，改善 +0.0063）。
 5 個 fold 的機率平均確實比單一 fold 更好，不是雜訊。
 
-**下一步**：`llmcls/train.py` 的 `train_fold()` / `_training_args()` 已經加上
-`label_smoothing` 參數（HF Trainer 內建支援，labels 不用先轉成 one-hot），
-`train_deberta.py` 加了一個獨立的實驗 cell——只在 fold 0 上跑
-`label_smoothing=0.1`（output_dir 跟主要的 5-fold 訓練分開，不會互相干擾），
-跟 fold 0 基準 1.06840 比較。**還沒 push 上 Kaggle 跑**，只有程式碼跟本機 33 項
-測試通過（`train.py` 本身不能本機測，需要 torch/transformers）。跑完這個實驗才
-知道要不要把全部 5 folds 重新訓練一次套上這個設定。milestone 3 剩下的訓練時 a/b
-對調增強、`winner_tie` 特殊處理則還沒開始。
+**Label smoothing 已在 fold 0 實測，結論是放棄**：`label_smoothing=0.1`
+（`train_fold()` 新增的參數，HF Trainer 內建支援）跑出 valid log loss
+**1.08815**，比基準 1.06840 **變差 0.01975**——是 TTA/校準實驗量到的雜訊量級
+（標準差 0.00288）的將近 7 倍，不是雜訊，是真的有害。放鬆訓練目標的信心，讓
+模型在本來能有把握答對的題目上也不敢預測太肯定，log loss 對「答對但不夠肯定」
+的懲罰蓋過了「答錯但太肯定」省下來的懲罰。`train_fold()` 的 `label_smoothing`
+參數留著（預設 0.0，不影響現有行為），但 `train_deberta.py` 裡測試用的 cell
+已經拿掉，不會再浪費 GPU 時間重跑。
+
+**訓練效能評估**（純研究，還沒真的套用）：DeBERTa-v3 的相對位置注意力機制不支援
+`attn_implementation="sdpa"`——實測會直接報錯（`DebertaV2ForSequenceClassification
+does not support ...`，對應 HF issue #28005，官方還沒補），這條路徹底放棄。
+`group_by_length=True`（把長度相近的樣本分到同一個 batch，減少 padding 浪費）
+原本擔心的風險是：這正好會主動把最長的句子集中到同一個 batch，而 batch_size=16
+在完整資料集上曾經因為「某一批全是長句子」只差 66MB 就 CUDA OOM。實測抓出 fold 0
+訓練集裡最長的 16 筆（fold 0 有 8.11% 的列打滿 max_len=512）組成最壞情況的一個
+batch，真的跑一次 forward+backward：**peak memory 11.122 GiB / 總量 14.562 GiB，
+餘裕 3.44 GiB（約 23.6%）**——比原本擔心的風險小很多，值得找時間實際跑一次完整
+fold 驗證有沒有用（單步測試沒炸不等於一整個 epoch 訓練下來、記憶體碎片化累積後
+也不會炸，仍需要完整訓練驗證）。另外用 `torch.profiler` 量過 15 步的時間分佈：
+耗最多 CUDA 時間的是 `aten::bmm`／`aten::linear`／`aten::gather_backward`／
+`aten::scatter_add_` 這類模型計算本身的運算（後兩者是 DeBERTa 相對位置編碼反向
+傳播），不是資料載入或 tokenize，確認 `num_workers`/`pin_memory` 這類 dataloader
+調整不會有明顯幫助。
+
+**下一步**：milestone 3 剩下訓練時 a/b 對調增強、`winner_tie` 特殊處理還沒開始；
+效能這邊 `group_by_length=True` 值得找時間實際上一次完整 fold 訓練驗證。
 
 ## 路線圖
 
@@ -210,10 +229,14 @@ TTA + 各自的校準溫度，5 組機率取平均）push 上 Kaggle 跑通、�
         已送出排行榜：public score 1.05159（milestone 2 為 1.07748）
   - [x] 5-fold 機率平均 ensemble：`infer_deberta.py` push 上 Kaggle 送排行榜，
         public score 1.04529（單 fold + TTA + 校準是 1.05159）
-  - [ ] label smoothing：`train_fold()` 已支援，`train_deberta.py` 加了 fold 0
-        獨立實驗 cell（vs 基準 1.06840），還沒 push 上 Kaggle 跑
+  - [x] label smoothing：fold 0 實測 `label_smoothing=0.1`，valid log loss
+        1.08815，比基準 1.06840 變差 0.01975（雜訊量級的 7 倍）——**放棄**
   - [ ] a/b 對調當「訓練時」的資料增強（目前只做了推論時的 TTA，訓練資料還沒加這個增強）
   - [ ] 針對 `winner_tie` 這一類的處理（通常是最難、也是 loss 的主要來源）
+  - [ ] 訓練效能：`group_by_length=True` 最壞情況記憶體壓力測試已通過（餘裕
+        23.6%，比原本擔心的風險小很多），還沒實際跑一次完整 fold 驗證時間省多少、
+        分數有沒有受影響。`attn_implementation="sdpa"` 已確認不支援（HF issue
+        #28005），放棄。
 - [ ] 里程碑 4：換更大的模型 + LoRA + 4bit 量化（需要自有 GPU 或雲端 GPU）
 
 ## 參考
