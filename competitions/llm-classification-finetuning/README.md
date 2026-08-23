@@ -147,7 +147,8 @@ fold 平均更穩。
 milestone 2 送出 143/212 那次的 1.08494 降到 1.06839——這是目前推論版本相對上次
 排行榜結果的主要改善來源，TTA/校準（+0.00935）是疊加上去的第二層。推論 kernel
 （`predict_logits_with_tta()` + `apply_temperature(T=1.238)`）已經用新 fold 0 權重
-在 Kaggle 上跑通、格式驗證通過，還沒送出新的排行榜分數。
+在 Kaggle 上跑通、格式驗證通過，並已送出排行榜：**public score 1.05159**（milestone 2
+單一 fold、無 TTA/校準那次是 1.07748，改善 +0.02589）。
 
 新增的 `llmcls/tta.py`（a/b 欄位對齊 + 平均）、`llmcls/calibration.py`
 （temperature scaling）都是純 numpy，24+9 項本機測試涵蓋（不用真的模型也測得到
@@ -180,10 +181,14 @@ Trainer 自己 `save_steps` 存的 `checkpoint-*/`（含 optimizer/scheduler sta
 複製過來跳過重新訓練——第二次只花約 1.9 小時（重練 fold 4 + 複製 fold 0-3）
 就補完整個 5-fold，不用整個重來一次 8.5 小時。
 
-**下一步（還沒做）**：目前推論還是只用單一 fold 0（+ TTA + 校準）。5 個 fold 都
-練完了，5-fold 機率平均 ensemble 應該還能再進一步改善（沒做過，不確定實際幅度），
-以及 milestone 3 剩下的 label smoothing、訓練時 a/b 對調增強、`winner_tie` 特殊
-處理都還沒開始。
+**5-fold 機率平均 ensemble 已送出排行榜**：`infer_deberta.py`（每個 fold 各自
+TTA + 各自的校準溫度，5 組機率取平均）push 上 Kaggle 跑通、送出排行榜：
+**public score 1.04529**（上一版單 fold + TTA + 校準是 1.05159，改善 +0.0063）。
+5 個 fold 的機率平均确实比單一 fold 更好，不是雜訊。
+
+**下一步**：milestone 3 剩下三項都還沒開始——label smoothing、訓練時 a/b 對調
+增強、`winner_tie` 特殊處理，這三項都需要重新訓練（會動到 `train.py` / 資料組裝，
+不像 TTA/校準/ensemble 那樣只改推論端）。
 
 ## 路線圖
 
@@ -197,11 +202,12 @@ Trainer 自己 `save_steps` 存的 `checkpoint-*/`（含 optimizer/scheduler sta
 - [ ] 里程碑 3：加上已知有效的手法
   - [x] a/b 對調 TTA + temperature scaling：5 folds 各自驗證，5/5 都有改善
         （平均 +0.00836），已套進 `infer_deberta.py`（fold 0 + T=1.238），
-        還沒送出新的排行榜分數
-  - [ ] label smoothing（需要重新訓練，還沒做——先確認 TTA/校準這條路有沒有用）
+        已送出排行榜：public score 1.05159（milestone 2 為 1.07748）
+  - [x] 5-fold 機率平均 ensemble：`infer_deberta.py` push 上 Kaggle 送排行榜，
+        public score 1.04529（單 fold + TTA + 校準是 1.05159）
+  - [ ] label smoothing（需要重新訓練，還沒做）
   - [ ] a/b 對調當「訓練時」的資料增強（目前只做了推論時的 TTA，訓練資料還沒加這個增強）
   - [ ] 針對 `winner_tie` 這一類的處理（通常是最難、也是 loss 的主要來源）
-  - [ ] 5-fold 機率平均 ensemble（5 folds 都練完了，還沒做）
 - [ ] 里程碑 4：換更大的模型 + LoRA + 4bit 量化（需要自有 GPU 或雲端 GPU）
 
 ## 參考

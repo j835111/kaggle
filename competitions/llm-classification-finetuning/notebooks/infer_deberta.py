@@ -1,27 +1,32 @@
 # %% [markdown]
-# # 推論（提交用）
+# # 推論（提交用）—— 5-fold 機率平均 ensemble
 #
-# **里程碑 3 更新**：`notebooks/calibrate_folds.py` 對 5 個 fold 各自量測過
+# **里程碑 3 最後一步**：`notebooks/calibrate_folds.py` 對 5 個 fold 各自量測過
 # a/b 對調 TTA + temperature scaling（每個 fold 用自己的驗證集重新配 T），
 # 5/5 個 fold 都有改善，平均改善 +0.00836（標準差 0.00288，明顯大於雜訊）：
 #
 # | fold | baseline | TTA+temperature | T（各自配的） |
 # |---|---|---|---|
-# | 0（推論用這個） | 1.06839 | **1.05904** | 1.192 |
+# | 0 | 1.06839 | 1.05904 | 1.192 |
 # | 1 | 1.05459 | 1.04256 | 1.055 |
 # | 2 | 1.07392 | 1.07019 | 1.331 |
 # | 3 | 1.08028 | 1.07358 | 1.514 |
 # | 4 | 1.05712 | 1.04711 | 1.097 |
 #
-# T 值跨 fold 差異不小（1.055~1.514，平均 1.238，標準差 0.167）——單一 fold 配出來
-# 的 T 對那個 fold 來說最準，但拿掉單一 fold 的雜訊之後，跨 fold 平均是更穩的估計，
-# 所以套用時用 **T=1.238**（5-fold 平均），不是 fold 0 自己配出來的 1.192。
+# 上一版（`git log` 可查）只用 fold 0 + TTA + 跨 fold 平均溫度 T=1.238，已送出排行榜
+# public score 1.05159（milestone 2 單一 fold、無 TTA/校準是 1.07748）。這一版換成
+# **5 個 fold 一起**：每個 fold 各自做 a/b 對調 TTA、各自套自己配出來的溫度（不是全部
+# 套同一個跨 fold 平均值——每個溫度是為那個 fold 自己的模型校準的），5 組校準後的
+# 機率再取平均，當最終提交的機率。
 #
-# fold 0 本身也在這次搶救 5-fold 訓練時被重新訓練過一次（驗證分數從 1.08494
-# 降到 1.06839），跟 milestone 2 送出 143/212 那次用的權重不是同一份——這是
-# 目前這個推論版本相對上一次排行榜結果的主要改善來源，TTA/校準是疊加上去的
-# 第二層改善。（5 個 fold 共用同一套模型/recipe/資料分布，不是 5 個獨立實驗，
-# 一致改善代表這不是單一切分的巧合，但不保證效果量完全轉移到隱藏測試集。）
+# 這是標準的 bagging 概念：5 個模型看過不同的 80% 訓練子集、隨機初始化跟訓練過程
+# 的雜訊也不一樣，會在不完全相同的地方犯錯，機率平均起來能讓誤差互相抵消一部分。
+# 但這件事本身**沒辦法在本機乾淨驗證**——每個 fold 的驗證集，另外 4 個模型訓練時
+# 都看過，拿它們一起評分會偏樂觀，所以「5 個 fold 平均是否真的比單一 fold 好」只能
+# 送一次排行榜才知道。
+#
+# 推論時間會變成單一 fold 版本的 5 倍（原本幾分鐘 → 預期十幾分鐘），目前判斷還不到
+# 需要額外加速的程度。
 #
 # 這是**推論** notebook，跟訓練 notebook（`train_deberta.py`）分開。這題是 code
 # competition，正式評分時 Kaggle 會把這個 notebook 的網路關掉，直接重跑一次，
@@ -45,40 +50,55 @@
 # >>> 這裡貼 notebooks/_bootstrap_cell.py 的完整內容 <<<
 
 # %%
-import os
 import pathlib
 
-_candidates = sorted(pathlib.Path("/kaggle/input").glob("**/fold0/model.safetensors"))
-print("找到的 fold0 checkpoint：", _candidates)
-if not _candidates:
-    print("/kaggle/input 底下的項目：", sorted(str(p) for p in pathlib.Path("/kaggle/input").iterdir()))
-    raise FileNotFoundError("找不到 fold0/model.safetensors —— 檢查 kernel_sources 是否正確接上訓練 kernel")
-os.environ["LLMCLS_MODEL_DIR"] = str(_candidates[0].parent)
-print("LLMCLS_MODEL_DIR =", os.environ["LLMCLS_MODEL_DIR"])
+import torch
 
-# %%
 from llmcls.calibration import apply_temperature
-from llmcls.config import MAX_LEN, MODEL_DIR
+from llmcls.config import MAX_LEN, N_FOLDS
 from llmcls.data import load_test
 from llmcls.submission import build_submission, save_submission
 from llmcls.train import load_trained, predict_logits_with_tta
 
-# 5-fold 平均溫度（notebooks/calibrate_folds.py 的量測結果，見上面的說明），
-# 不是 fold 0 自己配出來的 1.192——跨 fold 平均比單一 fold 的估計更穩。
-FITTED_TEMPERATURE = 1.238
+# 5-fold 各自配出來的溫度（notebooks/calibrate_folds.py 的量測結果，見上面的表格）
+# —— 每個溫度是為那個 fold 自己的模型校準的，不是全部套同一個常數。
+FOLD_TEMPERATURES = {0: 1.192, 1: 1.055, 2: 1.331, 3: 1.514, 4: 1.097}
 
-model, tokenizer = load_trained(MODEL_DIR)
+_fold_checkpoints = {}
+for p in sorted(pathlib.Path("/kaggle/input").glob("**/fold*/model.safetensors")):
+    fold_num = int(p.parent.name.replace("fold", ""))
+    _fold_checkpoints[fold_num] = p.parent
+
+print("找到的 fold checkpoint：")
+for fold_num in sorted(_fold_checkpoints):
+    print(f"  fold {fold_num}: {_fold_checkpoints[fold_num]}")
+
+_missing = set(range(N_FOLDS)) - set(_fold_checkpoints)
+if _missing:
+    print("/kaggle/input 底下的項目：", sorted(str(p) for p in pathlib.Path("/kaggle/input").iterdir()))
+    raise FileNotFoundError(f"缺少 fold {sorted(_missing)} 的 checkpoint —— 檢查 kernel_sources 是否接對訓練 kernel")
 
 # %%
 test = load_test()
 print(f"test: {len(test)} 列")  # 正式評分時這裡不會是 3
 
-# a/b 對調 TTA：兩種順序各推論一次、換回欄位對齊後在 logits 層級平均，
-# 再對合併後的 logits 套用配好的溫度。
-logits = predict_logits_with_tta(model, tokenizer, test, max_len=MAX_LEN, batch_size=32)
-probs = apply_temperature(logits, FITTED_TEMPERATURE)
+# 每個 fold：a/b 對調 TTA（兩種順序各推論一次、換回欄位對齊後在 logits 層級平均）
+# 接自己的溫度，softmax 之後得到這個 fold 的機率。5 個 fold 的機率最後取平均。
+probs_per_fold = []
+for fold in sorted(_fold_checkpoints):
+    model, tokenizer = load_trained(_fold_checkpoints[fold])
+    logits = predict_logits_with_tta(model, tokenizer, test, max_len=MAX_LEN, batch_size=32)
+    probs = apply_temperature(logits, FOLD_TEMPERATURES[fold])
+    probs_per_fold.append(probs)
+    print(f"fold {fold} 推論完成（T={FOLD_TEMPERATURES[fold]}）")
+
+    # 用完這個 fold 的模型就釋放 GPU 記憶體，避免 5 個 fold 依序跑、常駐記憶體疊加。
+    del model
+    torch.cuda.empty_cache()
+
+ensemble_probs = sum(probs_per_fold) / len(probs_per_fold)
 
 # %%
-sub = build_submission(test["id"], probs)
+sub = build_submission(test["id"], ensemble_probs)
 path = save_submission(sub)  # 驗證格式 + 寫到 /kaggle/working/submission.csv
 print(f"提交檔已寫入並通過格式檢查：{path}  ({len(sub)} 列)")
