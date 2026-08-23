@@ -42,20 +42,26 @@
 # `competition_sources` 也已經接了這個競賽的資料，`test.csv` 會是真正的隱藏測試集。
 #
 # **不要猜掛載路徑**——`competition_sources` 實測掛在 `/kaggle/input/competitions/
-# <slug>/` 而不是網頁 UI 那種 `/kaggle/input/<slug>/`；`kernel_sources` 實測也一樣
-# 不是原本猜的 `/kaggle/input/<kernel-slug>/`。下面直接用 glob 找 checkpoint 實際
+# <slug>/` 而不是網頁 UI 那種 `/kaggle/input/<slug>/`；`dataset_sources` 實測也一樣
+# 不是原本猜的 `/kaggle/input/<dataset-slug>/`。下面直接用 glob 找 checkpoint 實際
 # 在哪，不管 Kaggle 這次又把它掛在哪個路徑下都能動。
+#
+# 正式權重掛的是 `fold0-4-checkpoints`（獨立 Kaggle Dataset，不受任何 kernel 之後
+# push 影響——見 CLAUDE.md「正式權重只信 Dataset」），檔名是攤平的 `fold{N}__檔名`
+# （不是巢狀 `fold{N}/檔名`），下面先把它們還原成 HF `from_pretrained()` 認得的
+# 巢狀資料夾（複製到 `/kaggle/working/model/fold{N}/`），再用同一套 glob 邏輯抓。
 
 # %%
 # >>> 這裡貼 notebooks/_bootstrap_cell.py 的完整內容 <<<
 
 # %%
 import pathlib
+import shutil
 
 import torch
 
 from llmcls.calibration import apply_temperature
-from llmcls.config import MAX_LEN, N_FOLDS
+from llmcls.config import MAX_LEN, MODEL_DIR, N_FOLDS
 from llmcls.data import load_test
 from llmcls.submission import build_submission, save_submission
 from llmcls.train import load_trained, predict_logits_with_tta
@@ -64,10 +70,22 @@ from llmcls.train import load_trained, predict_logits_with_tta
 # —— 每個溫度是為那個 fold 自己的模型校準的，不是全部套同一個常數。
 FOLD_TEMPERATURES = {0: 1.192, 1: 1.055, 2: 1.331, 3: 1.514, 4: 1.097}
 
+for _p in pathlib.Path("/kaggle/input").glob("**/fold*__model.safetensors"):
+    fold_name, _ = _p.name.split("__", 1)
+    dst = MODEL_DIR / fold_name
+    if not dst.exists():
+        dst.mkdir(parents=True)
+        for _f in _p.parent.glob(f"{fold_name}__*"):
+            _, filename = _f.name.split("__", 1)
+            shutil.copy(_f, dst / filename)
+
 _fold_checkpoints = {}
 for p in sorted(pathlib.Path("/kaggle/input").glob("**/fold*/model.safetensors")):
     fold_num = int(p.parent.name.replace("fold", ""))
     _fold_checkpoints[fold_num] = p.parent
+for p in sorted(MODEL_DIR.glob("fold*/model.safetensors")):
+    fold_num = int(p.parent.name.replace("fold", ""))
+    _fold_checkpoints.setdefault(fold_num, p.parent)
 
 print("找到的 fold checkpoint：")
 for fold_num in sorted(_fold_checkpoints):
@@ -76,7 +94,7 @@ for fold_num in sorted(_fold_checkpoints):
 _missing = set(range(N_FOLDS)) - set(_fold_checkpoints)
 if _missing:
     print("/kaggle/input 底下的項目：", sorted(str(p) for p in pathlib.Path("/kaggle/input").iterdir()))
-    raise FileNotFoundError(f"缺少 fold {sorted(_missing)} 的 checkpoint —— 檢查 kernel_sources 是否接對訓練 kernel")
+    raise FileNotFoundError(f"缺少 fold {sorted(_missing)} 的 checkpoint —— 檢查 dataset_sources 是否接對權重 Dataset")
 
 # %%
 test = load_test()
