@@ -53,6 +53,14 @@ Dataset 更新掉舊的，不要只依賴 kernel 的輸出。
 **同一次 kernel 執行裡**同時跑 baseline 跟要測的版本，不要拿新跑的結果去跟舊
 session 的歷史數字比較。
 
+**已用這個修法重測過 label smoothing，結果印證了這個漏洞的嚴重性**：同一次
+kernel 執行內控制好種子的 baseline 是 1.08190，跟正式 5-fold 訓練 fold 0 的
+1.06840 差了 0.0135——同一個 fold、同一組超參數，只因為分類頭起始值不同就飄動
+這個量級，證實漏洞修好前的比較（label smoothing、group_by_length）confidence
+確實該打折扣。控制好之後，baseline 1.08190 vs `label_smoothing=0.1` 1.08140，
+差異只有 +0.00049（比 TTA/校準量到的雜訊量級 0.00288 還小）——第一次判定的
+「變差 0.01975」是偽陽性，真實結論是「幾乎沒差，不值得重練」，不是「有害」。
+
 ## Kaggle CLI（2.2.4）沒有「停止正在跑的 kernel」這個指令
 
 `kaggle kernels --help` 列出來的只有

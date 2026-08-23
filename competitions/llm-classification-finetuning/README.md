@@ -186,14 +186,19 @@ TTA + 各自的校準溫度，5 組機率取平均）push 上 Kaggle 跑通、�
 **public score 1.04529**（上一版單 fold + TTA + 校準是 1.05159，改善 +0.0063）。
 5 個 fold 的機率平均確實比單一 fold 更好，不是雜訊。
 
-**Label smoothing 已在 fold 0 實測，結論是放棄**：`label_smoothing=0.1`
-（`train_fold()` 新增的參數，HF Trainer 內建支援）跑出 valid log loss
-**1.08815**，比基準 1.06840 **變差 0.01975**——是 TTA/校準實驗量到的雜訊量級
-（標準差 0.00288）的將近 7 倍，不是雜訊，是真的有害。放鬆訓練目標的信心，讓
-模型在本來能有把握答對的題目上也不敢預測太肯定，log loss 對「答對但不夠肯定」
-的懲罰蓋過了「答錯但太肯定」省下來的懲罰。`train_fold()` 的 `label_smoothing`
-參數留著（預設 0.0，不影響現有行為），但 `train_deberta.py` 裡測試用的 cell
-已經拿掉，不會再浪費 GPU 時間重跑。
+**Label smoothing 控制實驗結果：幾乎沒差，不值得重練**：第一次在 fold 0 實測
+`label_smoothing=0.1`，valid log loss 1.08815，比基準 1.06840 變差 0.01975，
+判定「有害」——但那次的基準跟實驗是不同時間跑的兩次訓練，之後發現分類頭初始值
+沒被 seed 固定住（見下面），差距有可能大半是隨機運氣，不是 label smoothing 真的
+有害。用修好種子的版本重新做了一次同一個 kernel 執行內的控制 A/B（baseline 跟
+`label_smoothing=0.1` 分類頭起始值保證一致）：baseline **1.08190**、
+`label_smoothing=0.1` **1.08140**，**差異只有 +0.00049**——比 TTA/校準實驗量到
+的雜訊量級（標準差 0.00288）還小，代表這個差距本身就是雜訊，label smoothing
+既沒有像第一次測的那麼有害，也沒有真的變好。**結論：放棄**——不是因為它有害，
+是因為效果在雜訊範圍內，不值得為了看不出來的差距重練全部 5 個 fold。（順帶：
+這次控制實驗的 baseline 1.08190 跟正式 5-fold 訓練 fold 0 的 1.06840 差了
+0.0135，再次印證分類頭初始值真的能讓同一個 fold 飄動這個量級。）`train_fold()`
+的 `label_smoothing` 參數留著（預設 0.0，不影響現有行為）。
 
 **訓練效能評估**：`attn_implementation="sdpa"` 對 DeBERTa-v3 不支援，實測直接
 報錯（`DebertaV2ForSequenceClassification does not support ...`，對應 HF issue
@@ -228,18 +233,17 @@ valid log loss 從 1.05712 飄動到 1.07493（+0.01781），且沒有發散**�
 `AutoModelForSequenceClassification.from_pretrained()`（隨機初始化新的分類頭）
 是在 `Trainer` 建立、`TrainingArguments(seed=42)` 生效**之前**執行的——那個 seed
 從來沒真正固定住分類頭的起始值，只固定了訓練過程（資料洗牌、dropout）的隨機性。
-這代表**label smoothing 判定「變差 0.01975」、group_by_length 那次比較，都可能
-有一部分（甚至大部分）只是分類頭初始值不同造成的隨機波動，不是那個手法真的有害**。
-`train_fold()` 已經修正（`from_pretrained()` 之前先呼叫 `set_seed()`），label
-smoothing 用修好的版本重新做了一次同一個 kernel 執行內的 baseline vs
-`label_smoothing=0.1` 控制實驗（兩邊分類頭起始值保證一致），已 push 上 Kaggle
-（train_kernel version 19）——結果還沒回來。group_by_length 的發散結論維持，
-但信心度較低，還沒有用修好的版本重新驗證過。
+這代表**label smoothing 第一次判定「變差 0.01975」、group_by_length 那次比較，
+都可能有一部分（甚至大部分）只是分類頭初始值不同造成的隨機波動，不是那個手法
+真的有害**。`train_fold()` 已經修正（`from_pretrained()` 之前先呼叫
+`set_seed()`），label smoothing 用修好的版本重新驗證過（見上面「控制實驗結果」
+段落），group_by_length 的發散結論維持，但信心度較低，還沒有用修好的版本重新
+驗證過。
 
-**下一步**：等 label smoothing 的控制實驗結果回來，milestone 3 剩下訓練時 a/b
-對調增強、`winner_tie` 特殊處理還沒開始；訓練效能這條線目前評估過的候選手法
-（sdpa、group_by_length、dataloader 調整）全部放棄或無效，`torch.compile()`
-因為 DeBERTa 自訂運算容易觸發頻繁重新編譯，評估認為優先度太低沒有試。
+**下一步**：milestone 3 剩下訓練時 a/b 對調增強、`winner_tie` 特殊處理還沒
+開始；訓練效能這條線目前評估過的候選手法（sdpa、group_by_length、dataloader
+調整）全部放棄或無效，`torch.compile()` 因為 DeBERTa 自訂運算容易觸發頻繁
+重新編譯，評估認為優先度太低沒有試。
 
 ## 路線圖
 
@@ -259,8 +263,9 @@ smoothing 用修好的版本重新做了一次同一個 kernel 執行內的 base
         已送出排行榜：public score 1.05159（milestone 2 為 1.07748）
   - [x] 5-fold 機率平均 ensemble：`infer_deberta.py` push 上 Kaggle 送排行榜，
         public score 1.04529（單 fold + TTA + 校準是 1.05159）
-  - [x] label smoothing：fold 0 實測 `label_smoothing=0.1`，valid log loss
-        1.08815，比基準 1.06840 變差 0.01975（雜訊量級的 7 倍）——**放棄**
+  - [x] label smoothing：控制好種子重測（同一次 kernel 執行內 baseline vs
+        `label_smoothing=0.1`），差異只有 +0.00049（比雜訊量級 0.00288 還小）
+        ——**放棄**（第一次測的「變差 0.01975」是分類頭初始值沒固定住的偽陽性）
   - [ ] a/b 對調當「訓練時」的資料增強（目前只做了推論時的 TTA，訓練資料還沒加這個增強）
   - [ ] 針對 `winner_tie` 這一類的處理（通常是最難、也是 loss 的主要來源）
   - [x] 訓練效能：`attn_implementation="sdpa"` 不支援（HF issue #28005）、
