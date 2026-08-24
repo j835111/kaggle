@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import inspect
-import math
 import os
 import shutil
 from pathlib import Path
@@ -36,6 +35,7 @@ from llmcls.data import load_test, load_train
 from llmcls.metrics import UNIFORM_LOGLOSS, log_loss, softmax
 from llmcls.submission import build_submission, save_submission
 from llmcls.text import build_input_ids, swap_ab_label
+from llmcls.training_safety import should_stop_for_nonfinite
 from llmcls.tta import average_swapped
 
 
@@ -96,22 +96,34 @@ class StopOnNonFiniteLoss(TrainerCallback):
     之後每一步都是壞的，權重永久壞掉但 Trainer 完全不知道、還是把剩下的 epoch 跑完
     （實測浪費了 83 分鐘 GPU 時間裡的 70 分鐘）。這裡一偵測到就叫它停，把剩下的時間
     省下來，`triggered` 讓呼叫端知道這次訓練發散過、權重不可信。
+
+    只看單一次 log 的 grad_norm 曾經誤判過：fp16 下 GradScaler 遇到某一步梯度
+    溢位會自動跳過那次更新、調低 scale factor 再繼續，這是正常現象，loss 本身
+    仍然健康，不代表訓練壞掉——實測 group_by_length 那次「發散」在觸發停止的
+    那一行 loss 是 1.079（跟前面每一步一樣正常），只有 grad_norm 是 inf，判定
+    「有害」其實是這個過度敏感的舊邏輯誤觸發。真正的判斷邏輯（loss 非有限值
+    立刻停；grad_norm 非有限值要連續 `grad_norm_patience` 次才算真的卡住）在
+    `llmcls.training_safety.should_stop_for_nonfinite()`，本機有測試覆蓋。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, grad_norm_patience: int = 3) -> None:
         self.triggered = False
+        self.grad_norm_patience = grad_norm_patience
+        self._consecutive_nonfinite_grad_norm = 0
 
     def on_log(self, args, state, control, logs=None, **kwargs):
-        if logs and any(
-            isinstance(v, (int, float)) and not math.isfinite(v) for k, v in logs.items() if k in ("loss", "grad_norm")
-        ):
-            control.should_training_stop = True
-            self.triggered = True
+        if logs:
+            should_stop, self._consecutive_nonfinite_grad_norm = should_stop_for_nonfinite(
+                logs, self._consecutive_nonfinite_grad_norm, self.grad_norm_patience
+            )
+            if should_stop:
+                control.should_training_stop = True
+                self.triggered = True
         return control
 
 
-# log_loss 不可能自然達到的高值，只用來確保「發散」在 metric_for_best_model 排序上
-# 一定輸給任何健康的 checkpoint（見 _compute_metrics 的說明）。
+# log_loss 不可能自然達到的高值，訓練中途的 log 看到這個數字就知道那次週期性
+# 評估算在非有限值上，是壞掉的資料點，不是真的分數。
 _NONFINITE_SENTINEL = 99.0
 
 
@@ -120,9 +132,8 @@ def _compute_metrics(eval_pred) -> dict:
     Trainer 的 eval callback，一炸整個 run 就白跑、連權重都存不到，所以不能用 raise。
 
     早期版本把非有限值夾到均勻機率再算分——結果發散的 checkpoint 剛好算出
-    log loss = ln(3)，而 greater_is_better=False 之下 ln(3) 比任何健康 checkpoint
-    的分數都「小」，load_best_model_at_end 反而會選中發散的那個。改成回報一個大到
-    不可能自然出現的哨兵值，讓發散的 checkpoint 在排序上必輸。
+    log loss = ln(3)，跟真的健康、剛好打平基準的 checkpoint 混在一起分不出來。
+    改成回報一個大到不可能自然出現的哨兵值，訓練中途的 log 一看就知道那個點壞了。
     """
     logits, labels = eval_pred
     probs = softmax(np.asarray(logits))
@@ -150,12 +161,20 @@ def _training_args(
     # 版本不固定，用 inspect 挑對的參數名比硬編一個更穩。
     params = inspect.signature(TrainingArguments.__init__).parameters
     strategy_key = "eval_strategy" if "eval_strategy" in params else "evaluation_strategy"
-    # 一律用 steps（不是 epoch）當 eval/save 的節奏，完整訓練也一樣 —— 實測 DeBERTa-v3
-    # 在 fp32 訓練到一半會發散，只在 epoch 邊界存檔的話，發散前那個還健康的檢查點根本
-    # 沒機會被存下來，load_best_model_at_end 也就沒有東西可挑。1500 是給完整訓練用的
-    # 預設值：跟 eval_subset_rows 搭配（train_fold 會把訓練中途的評估換成子集），
-    # 拉開頻率不會犧牲發散偵測 —— 那是每 50 步看 loss/grad_norm 的 StopOnNonFiniteLoss
+    # 一律用 steps（不是 epoch）當 eval/save 的節奏，完整訓練也一樣 —— 中途的週期性
+    # 存檔是拿來在 kernel 中途出狀況時當復原點用的，1500 是給完整訓練用的預設值：
+    # 跟 eval_subset_rows 搭配（train_fold 會把訓練中途的評估換成子集），拉開頻率
+    # 不會犧牲發散偵測 —— 那是每 50 步看 loss/grad_norm 的 StopOnNonFiniteLoss
     # callback 在管，跟這裡的 eval 節奏無關。
+    #
+    # 不用 load_best_model_at_end：實測踩到一個問題——同樣的設定重跑兩次，
+    # `load_best_model_at_end` 靠訓練中途對 eval_subset_rows（2000 筆）子集算出來
+    # 的分數去挑「最佳」checkpoint，這個子集本身雜訊就不小，兩次重跑各自挑到不同
+    # 進度的 checkpoint 當最終權重（實測分別挑中 epoch 1.049 跟 epoch 1.574），
+    # 光是這個選擇上的雜訊就足以讓兩次「應該一樣」的最終分數飄動超過 0.01——跟
+    # label smoothing/a、b 對調增強量到的效果量同一個量級，會讓 A/B 比較失去意義。
+    # 子集分數只拿來在訓練中途看趨勢（原本的設計目的），不該拿來決定「用哪個版本
+    # 的權重」；固定用訓練跑完當下的最終狀態，才不會多引入這層雜訊。
     default_eval_steps = max(1, max_steps // 2) if max_steps is not None else 1500
     steps = eval_steps or default_eval_steps
     kwargs = dict(
@@ -165,9 +184,7 @@ def _training_args(
         eval_steps=steps,
         save_steps=steps,
         save_total_limit=1,
-        load_best_model_at_end=True,
-        metric_for_best_model="log_loss",
-        greater_is_better=False,
+        load_best_model_at_end=False,
         learning_rate=lr,
         lr_scheduler_type=lr_scheduler_type,
         per_device_train_batch_size=batch_size,
@@ -365,9 +382,10 @@ def train_fold(
     if stop_callback.triggered:
         print("偵測到 loss/grad_norm 變成 NaN，已提前停止訓練 —— 這次的權重不可信，不要拿去推論")
 
-    # 存檔緊接在 train() 後面、explicit evaluate() 之前 —— load_best_model_at_end=True
-    # 已經把最佳權重換回 trainer.model，這裡先存起來，後面的 evaluate() 就算出狀況
-    # 也不會白跑一整個 epoch 的 GPU 時間卻什麼都沒留下。
+    # 存檔緊接在 train() 後面、explicit evaluate() 之前 —— 不用 load_best_model_at_end
+    # 挑歷史最佳（見 _training_args 的說明），trainer.model 現在就是訓練跑完當下的
+    # 最終狀態，這裡先存起來，後面的 evaluate() 就算出狀況也不會白跑一整個 epoch 的
+    # GPU 時間卻什麼都沒留下。
     trainer.save_model(str(output_dir))
     tokenizer.save_pretrained(str(output_dir))
 
