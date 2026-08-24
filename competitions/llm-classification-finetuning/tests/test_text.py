@@ -10,7 +10,7 @@ import pytest
 COMP_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(COMP_ROOT / "src"))
 
-from llmcls.text import NUM_SPECIAL_TOKENS, build_input_ids, split_budget, truncate_ids
+from llmcls.text import NUM_SPECIAL_TOKENS, build_input_ids, split_budget, swap_ab_label, truncate_ids
 
 
 def test_truncate_ids_noop_when_within_budget():
@@ -63,3 +63,17 @@ def test_build_input_ids_no_truncation_when_short():
 def test_build_input_ids_rejects_too_small_max_len():
     with pytest.raises(ValueError, match="太小"):
         build_input_ids([1], [2], [3], max_len=NUM_SPECIAL_TOKENS)
+
+
+def test_swap_ab_label_flips_a_and_b():
+    assert swap_ab_label(0) == 1
+    assert swap_ab_label(1) == 0
+
+
+def test_swap_ab_label_keeps_tie():
+    assert swap_ab_label(2) == 2
+
+
+def test_swap_ab_label_is_its_own_inverse():
+    for label in (0, 1, 2):
+        assert swap_ab_label(swap_ab_label(label)) == label

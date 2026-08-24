@@ -41,6 +41,16 @@ def split_budget(total: int, ratios: tuple[float, float, float] = DEFAULT_RATIOS
     return (a, b, c)
 
 
+def swap_ab_label(label: int) -> int:
+    """訓練時 a/b 對調增強用：response_a/response_b 對調之後，原本「a 贏」
+    （0）要變成「b 贏」（1），「b 贏」要變成「a 贏」，「打平」（2）不受影響
+    ——這兩類是靠標籤本身的整數編碼互換位置，跟 llmcls.train.swap_ab() 只換
+    DataFrame 欄位、不動標籤是兩回事（那個是給推論 TTA 用的，模型輸出的機率
+    欄位事後靠 [:, [1, 0, 2]] 換回來對齊，不需要動標籤）。
+    """
+    return 1 - label if label in (0, 1) else label
+
+
 def build_input_ids(
     prompt_ids: list[int],
     response_a_ids: list[int],

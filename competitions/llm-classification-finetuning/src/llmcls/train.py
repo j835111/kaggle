@@ -35,17 +35,30 @@ from llmcls.cv import add_folds, fold_indices
 from llmcls.data import load_test, load_train
 from llmcls.metrics import UNIFORM_LOGLOSS, log_loss, softmax
 from llmcls.submission import build_submission, save_submission
-from llmcls.text import build_input_ids
+from llmcls.text import build_input_ids, swap_ab_label
 from llmcls.tta import average_swapped
 
 
 class PreferenceDataset(torch.utils.data.Dataset):
     """把三欄文字 tokenize 成單一序列：[CLS] prompt [SEP] response_a [SEP] response_b [SEP]。"""
 
-    def __init__(self, df: pd.DataFrame, tokenizer, max_len: int, labels: np.ndarray | None):
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        tokenizer,
+        max_len: int,
+        labels: np.ndarray | None,
+        ab_swap_prob: float = 0.0,
+    ):
         self.tokenizer = tokenizer
         self.max_len = max_len
         self.labels = labels
+        self.ab_swap_prob = ab_swap_prob
+        # 訓練時 a/b 對調增強（milestone 3）：獨立的 RNG，不動 Python/numpy 的全域
+        # 亂數狀態——Trainer 自己的資料洗牌也是靠全域亂數狀態，兩邊共用同一個全域
+        # 產生器的話，開不開這個選項會連帶改變洗牌順序，A/B 比較就不乾淨了。固定
+        # 用 SEED 起始，同一個 seed 重跑兩次會抽到同一組對調決定。
+        self._rng = np.random.default_rng(SEED) if ab_swap_prob > 0 else None
         # 預先 encode 三欄一次，__getitem__ 只做截斷 + 拼接，不用每個 epoch 重複 tokenize。
         # 整批呼叫 tokenizer(...)，不要逐列呼叫 tokenizer.encode()——fast tokenizer 的
         # 平行化是在批次呼叫內部做的（Rust 那邊自己開執行緒），逐列呼叫每次都要重新付一次
@@ -59,14 +72,22 @@ class PreferenceDataset(torch.utils.data.Dataset):
         return len(self.prompt_ids)
 
     def __getitem__(self, idx: int) -> dict:
-        p, a, b = build_input_ids(
-            self.prompt_ids[idx], self.response_a_ids[idx], self.response_b_ids[idx], self.max_len
-        )
+        a_ids, b_ids = self.response_a_ids[idx], self.response_b_ids[idx]
+        label = int(self.labels[idx]) if self.labels is not None else None
+        # 每次被抓取都重新擲一次骰子（不是固定對調某一半資料）——同一列資料在不同
+        # epoch 可能拿到不同順序，訓練久了每一列平均都看過兩種順序。只有訓練集會
+        # 傳非 0 的 ab_swap_prob，驗證集固定用原始順序，score 才能跟沒開這個選項
+        # 的訓練直接比較。
+        if self._rng is not None and self._rng.random() < self.ab_swap_prob:
+            a_ids, b_ids = b_ids, a_ids
+            if label is not None:
+                label = swap_ab_label(label)
+        p, a, b = build_input_ids(self.prompt_ids[idx], a_ids, b_ids, self.max_len)
         cls_id, sep_id = self.tokenizer.cls_token_id, self.tokenizer.sep_token_id
         input_ids = [cls_id, *p, sep_id, *a, sep_id, *b, sep_id]
         item = {"input_ids": input_ids, "attention_mask": [1] * len(input_ids)}
-        if self.labels is not None:
-            item["labels"] = int(self.labels[idx])
+        if label is not None:
+            item["labels"] = label
         return item
 
 
@@ -226,6 +247,7 @@ def train_fold(
     eval_subset_rows: int | None = None,
     label_smoothing: float = 0.0,
     group_by_length: bool = False,
+    ab_swap_prob: float = 0.0,
 ) -> dict:
     """練一個 fold，存權重，回傳 {"score", "n_nonfinite", "diverged", "output_dir",
     "trainer", "tokenizer"}。
@@ -256,6 +278,17 @@ def train_fold(
     forward+backward 不會 OOM（餘裕 23.6%），但那是單步測試，完整一個 epoch 訓練
     下來記憶體碎片化累積會不會更緊繃還沒驗證過，第一次用這個設定時不要跳過
     `diverged`/`n_nonfinite` 的檢查。
+
+    `ab_swap_prob`（milestone 3，訓練時 a/b 對調增強）：訓練集每一筆資料在每次
+    被 `PreferenceDataset.__getitem__` 抓取時，有這個機率被動態對調
+    response_a/response_b（連同標籤一起用 `swap_ab_label()` 對調：0⟷1，2 不變），
+    每個 epoch 重新擲一次骰子，同一列在不同 epoch 可能拿到不同順序。只套用在
+    訓練集，驗證集固定用原始順序不受影響，`score` 才能跟沒開這個選項的訓練直接
+    比較。0.0 是關閉，跟原本行為一樣。動機：winner_tie 診斷（見
+    `calibrate_folds.py`）發現模型對 `winner_model_a`/`winner_model_b` 兩類的
+    原始（未做 TTA）log loss 落差很大（1.04710 vs 1.11257），推論時的 TTA 已經
+    在事後修正一部分，這裡要測的是訓練時直接解決順序偏見，減少對推論時 TTA
+    的依賴。
 
     `batch_size` 調大要非常小心：煙霧測試只能驗證穩定性（會不會發散），驗不出「完整
     資料集上的記憶體上限」——`max_train_rows` 抽樣的子集很難剛好抽到全是接近
@@ -304,7 +337,7 @@ def train_fold(
         tr_df = tr_df.sample(n=min(max_train_rows, len(tr_df)), random_state=SEED).reset_index(drop=True)
     if max_valid_rows is not None:
         va_df = va_df.sample(n=min(max_valid_rows, len(va_df)), random_state=SEED).reset_index(drop=True)
-    tr_ds = PreferenceDataset(tr_df, tokenizer, max_len, tr_df["label"].to_numpy())
+    tr_ds = PreferenceDataset(tr_df, tokenizer, max_len, tr_df["label"].to_numpy(), ab_swap_prob=ab_swap_prob)
     va_ds = PreferenceDataset(va_df, tokenizer, max_len, va_df["label"].to_numpy())
 
     # 訓練中途的週期性評估用子集（快很多），最後才對完整驗證集重新算一次真正的分數。

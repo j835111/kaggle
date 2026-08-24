@@ -87,50 +87,93 @@ assert not smoke["diverged"] and smoke["n_nonfinite"] == 0, (
 print("煙霧測試通過，加速設定沒有引入不穩定")
 
 # %% [markdown]
-# ## Label smoothing 實驗（milestone 3，重新做一次——第一次測的方法有漏洞）
+# ## Label smoothing 實驗（milestone 3，已測完，結論：放棄）
 #
-# **第一次測的問題**：在補練 fold 4 的時候發現，`train_fold()` 原本在載入模型
-# （`AutoModelForSequenceClassification.from_pretrained()`，分類頭是隨機初始化的
-# 新的一層）之後才建立 `Trainer`、`TrainingArguments(seed=42)` 才生效——分類頭的
-# 起始隨機值從來沒被這個 seed 固定住。實測同一個 fold、完全相同設定重跑一次，valid
-# log loss 可以飄動 0.01~0.02，跟第一次判定 label smoothing 「變差 0.01975」是同一
-# 個量級——那次比較的兩個分數來自不同時間跑的兩次訓練，分類頭起始值本來就不一樣，
-# 差距有可能大部分只是隨機運氣，不是 label smoothing 真的有害。已經在 `train_fold()`
-# 裡加了 `set_seed(SEED)`（在載入模型之前呼叫），現在同一個 seed 重跑會拿到同一個
-# 分類頭起始值。
-#
-# **這次重做**：baseline 跟 `label_smoothing=0.1` 都在**同一次 kernel 執行**裡各自
-# 呼叫一次 `train_fold()`——兩次呼叫各自呼叫到的 `set_seed(SEED)` 保證兩邊的分類頭
-# 起始值一致，才是真正公平的 A/B 比較，不再跟舊 session 的歷史數字比較。output_dir
-# 都跟主要 5-fold 訓練分開，不影響正式權重。
-
-# %%
-ab_baseline = train_fold(
-    fold=0, epochs=2, batch_size=8, max_len=512, lr=2e-5,
-    fp16=True, eval_steps=1500, eval_subset_rows=2000,
-    output_dir="/kaggle/working/model/_seed_fixed_baseline_fold0",
-)
-print(f"baseline（無 label smoothing）valid log loss: {ab_baseline['score']:.5f}")
-assert not ab_baseline["diverged"] and ab_baseline["n_nonfinite"] == 0, (
-    "baseline 重跑就發散了，seeding 修法本身可能有問題，先不要信下面的比較"
-)
-
-ab_label_smoothing = train_fold(
-    fold=0, epochs=2, batch_size=8, max_len=512, lr=2e-5,
-    fp16=True, eval_steps=1500, eval_subset_rows=2000,
-    label_smoothing=0.1,
-    output_dir="/kaggle/working/model/_seed_fixed_label_smoothing_fold0",
-)
-print(f"label_smoothing=0.1 valid log loss: {ab_label_smoothing['score']:.5f}")
-assert not ab_label_smoothing["diverged"] and ab_label_smoothing["n_nonfinite"] == 0, (
-    "label smoothing 訓練發散或有非有限值，不要拿這個結果做決定"
-)
-
-print(f"差異：{ab_baseline['score'] - ab_label_smoothing['score']:+.5f}（正值代表 label smoothing 有幫助）")
+# 第一次在 fold 0 實測 `label_smoothing=0.1`，valid log loss 1.08815，比基準
+# 1.06840 變差 0.01975，判定「有害」——但那次的基準跟實驗是不同時間跑的兩次
+# 訓練，後來發現分類頭初始值沒被 `TrainingArguments(seed=42)` 固定住
+# （`from_pretrained()` 隨機初始化新的分類頭是在 `Trainer` 建立、seed 生效**之前**
+# 執行的），差距有可能大半是隨機運氣，不是 label smoothing 真的有害。`train_fold()`
+# 已修正（`from_pretrained()` 之前先呼叫 `set_seed(SEED)`），用修好的版本重新做了
+# 一次同一個 kernel 執行內的控制 A/B（baseline 跟 `label_smoothing=0.1` 分類頭
+# 起始值保證一致）：baseline **1.08190**、`label_smoothing=0.1` **1.08140**，
+# 差異只有 **+0.00049**——比 TTA/校準量到的雜訊量級（標準差 0.00288）還小，代表
+# 這個差距本身就是雜訊。**結論：放棄**——不是因為它有害，是因為效果在雜訊範圍內，
+# 不值得為了看不出來的差距重練全部 5 個 fold。詳細數字見 README.md「目前狀態」
+# 段落。`train_fold()` 的 `label_smoothing` 參數留著（預設 0.0，不影響現有行為），
+# 測試用的 cell 已經拿掉，不會再浪費 GPU 時間重跑。
 
 # %% [markdown]
-# 詳細數字見 README.md「目前狀態」段落。milestone 3 剩下的候選手法：訓練時 a/b
-# 對調增強、`winner_tie` 特殊處理。
+# ## 訓練時 a/b 對調增強實驗（milestone 3，這次要測的）
+#
+# **動機**：`calibrate_folds.py` 的 winner_tie 診斷（把 5 個 fold 的驗證集預測
+# 拼起來、照真實答案分三類算 log loss）發現模型對 `winner_model_a`/`winner_model_b`
+# 兩類原始（未做 TTA/校準）的 log loss 落差很大：1.04710 vs 1.11257——反而
+# `winner_tie` 本身沒有特別難（1.05011，三類裡最低）。推論時的 TTA（a/b 對調再
+# 平均）已經在事後修正這個落差的一部分，這裡要測的是「直接在訓練時解決」：訓練
+# 時讓模型有機率看到對調過順序（連同標籤一起對調：`swap_ab_label()`，
+# `winner_model_a`⟷`winner_model_b` 互換、`winner_tie` 不變）的版本，減少模型
+# 對「誰先出現」的偏見，而不是只靠推論時事後補救。
+#
+# **實作**：`PreferenceDataset` 新增 `ab_swap_prob` 參數——每一筆資料在每次
+# `__getitem__` 被抓取時（也就是每個 epoch）都重新擲一次骰子，不是固定對調某
+# 一半資料，同一列在不同 epoch 可能拿到不同順序。只套用在訓練集，驗證集固定用
+# 原始順序不受影響——`score` 才能跟沒開這個選項的訓練直接比較。用獨立的
+# `np.random.default_rng(SEED)`，不動 Trainer 自己靠全域亂數狀態做的資料洗牌。
+# `swap_ab_label()`（`llmcls/text.py`，純 Python、本機已經有測試）確保標籤對調
+# 邏輯不會弄錯方向。
+#
+# **這次測試**：比照 label smoothing 修好種子後的做法，baseline 跟
+# `ab_swap_prob=0.5` 都在同一次 kernel 執行裡各自呼叫一次 `train_fold()`，分類頭
+# 起始值保證一致才是公平 A/B。先跑一個小規模煙霧測試確認新程式碼路徑在 GPU 上不會
+# 直接壞掉（本機沒有 torch，這段程式碼完全沒在真正的 GPU/tokenizer 上跑過），
+# 通過才進入正式的 fold 0 控制實驗（約 4 小時 GPU）。
+#
+# **需要留意的風險**：TTA 已經在吃掉一部分「順序偏見」的紅利，這次的訓練時增強
+# 有可能只是重複做同一件事、疊加起來看不出額外差異，也有可能真的讓模型本身更不
+# 偏頗、帶來 TTA 吃不到的額外改善——這是實測才知道的事，不是先驗判斷得出來的。
+
+# %%
+ab_swap_smoke = train_fold(
+    fold=0, epochs=1, batch_size=8, max_len=512, lr=2e-5,
+    lr_scheduler_type="constant_with_warmup", fp16=True,
+    max_train_rows=3000, max_valid_rows=800, max_steps=100, eval_steps=50,
+    ab_swap_prob=0.5,
+    output_dir="/kaggle/working/model/_ab_swap_smoke",
+)
+print(f"ab_swap_prob 煙霧測試 log loss={ab_swap_smoke['score']:.5f}  diverged={ab_swap_smoke['diverged']}")
+assert not ab_swap_smoke["diverged"] and ab_swap_smoke["n_nonfinite"] == 0, (
+    "ab_swap_prob 新程式碼路徑煙霧測試就不穩定，不要繼續跑正式實驗"
+)
+print("煙霧測試通過，ab_swap_prob 這條新程式碼路徑沒有明顯壞掉")
+
+# %%
+ab_swap_baseline = train_fold(
+    fold=0, epochs=2, batch_size=8, max_len=512, lr=2e-5,
+    fp16=True, eval_steps=1500, eval_subset_rows=2000,
+    output_dir="/kaggle/working/model/_ab_swap_baseline_fold0",
+)
+print(f"baseline（無 a/b 對調增強）valid log loss: {ab_swap_baseline['score']:.5f}")
+assert not ab_swap_baseline["diverged"] and ab_swap_baseline["n_nonfinite"] == 0, (
+    "baseline 訓練發散或有非有限值，不要拿這個結果做決定"
+)
+
+ab_swap_variant = train_fold(
+    fold=0, epochs=2, batch_size=8, max_len=512, lr=2e-5,
+    fp16=True, eval_steps=1500, eval_subset_rows=2000,
+    ab_swap_prob=0.5,
+    output_dir="/kaggle/working/model/_ab_swap_variant_fold0",
+)
+print(f"ab_swap_prob=0.5 valid log loss: {ab_swap_variant['score']:.5f}")
+assert not ab_swap_variant["diverged"] and ab_swap_variant["n_nonfinite"] == 0, (
+    "a/b 對調增強訓練發散或有非有限值，不要拿這個結果做決定"
+)
+
+print(f"差異：{ab_swap_baseline['score'] - ab_swap_variant['score']:+.5f}（正值代表 a/b 對調增強有幫助）")
+
+# %% [markdown]
+# 詳細數字見 README.md「目前狀態」段落。milestone 3 剩下的候選手法：`winner_tie`
+# 特殊處理——今天的診斷顯示 tie 反而不是損失最集中的類別，優先度已下修。
 
 # %% [markdown]
 # ## `group_by_length` 實驗（訓練效能，已測完，結論：放棄）
