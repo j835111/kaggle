@@ -200,6 +200,26 @@ TTA + 各自的校準溫度，5 組機率取平均）push 上 Kaggle 跑通、�
 0.0135，再次印證分類頭初始值真的能讓同一個 fold 飄動這個量級。）`train_fold()`
 的 `label_smoothing` 參數留著（預設 0.0，不影響現有行為）。
 
+**winner_tie 診斷：損失不是集中在 tie，反而是 model_a/model_b 有順序偏見**：
+`calibrate_folds.py` 把 5 個 fold 的驗證集預測拼起來（等於用整份 `train.csv`
+做一次完整覆蓋的 held-out 檢驗），照真實答案分三類算 log loss。整體 baseline
+1.07041 → TTA+temperature 校準後 1.06249。按類別拆解（TTA+校準後）：
+`winner_model_a` 1.07294（比 baseline 1.04710 還差，TTA 對這類是負向）、
+`winner_model_b` 1.06996（比 baseline 1.11257 大幅改善）、`winner_tie` 1.04242
+（三類最低，比 baseline 1.05011 也有改善）。**跟原本以為 tie 最難的假設相反，
+tie 反而是最容易的一類**——`winner_tie` 專屬處理的優先度因此下修。但看得出
+模型對「a 贏」/「b 贏」這兩類原始判斷力有明顯落差（1.04710 vs 1.11257），像是
+對回覆出現的順序有偏見，TTA 已經在事後修正一部分。
+
+**訓練時 a/b 對調增強實驗（結果待重新驗證，見下面的量測 bug）**：針對上面的順序
+偏見，`PreferenceDataset` 新增 `ab_swap_prob` 參數——訓練集每一筆資料每次被抓取
+時有機率動態對調 response_a/response_b（連同標籤用 `swap_ab_label()` 一起對調），
+只套用在訓練集，驗證集不受影響。同一個 kernel 執行內控制 A/B：baseline
+**1.09416**、`ab_swap_prob=0.5` **1.08516**，差異 **+0.00899**（看起來有幫助）。
+但這次量到的 baseline（1.09416）跟前面 label smoothing 那次的 baseline
+（完全一樣設定：1.08190）差了 0.01226，跟這裡量到的效果量同一個量級——下面
+找到兩個真正的原因，這個 +0.00899 的結論在修好之前不能直接採信。
+
 **訓練效能評估**：`attn_implementation="sdpa"` 對 DeBERTa-v3 不支援，實測直接
 報錯（`DebertaV2ForSequenceClassification does not support ...`，對應 HF issue
 #28005，官方還沒補），放棄。`torch.profiler` 量過 15 步的時間分佈：耗最多 CUDA
@@ -216,7 +236,10 @@ batch 的梯度震幅更劇烈，更容易踩到 fp16 數值溢位。訓練被�
 1256s（比基準快 79%）」「valid log loss 1.09921（比基準差 0.03081）」**兩個數字
 都不是有效比較**——是訓練只跑了四分之一被緊急煞車，不是 group_by_length 真的更快
 或更差。結論：**放棄**，`train_fold()` 的 `group_by_length` 參數留著（預設
-False，行為不變）。
+False，行為不變）。**更新（見下面「量測 bug」段落）**：這個「發散」後來查出很可能
+是 `StopOnNonFiniteLoss` 誤判——觸發停止那一行的 `loss` 其實是 1.079（健康），
+只有 `grad_norm` 是 inf，這個訊號後來被證實是 fp16 GradScaler 正常的跳過-繼續
+行為，不是真的訓練壞掉。**這個放棄的結論信心度現在很低，值得用修好的版本重測。**
 
 **修復 fold 4 遺失、備份完整 5-fold Dataset**：上面幾次為了做實驗 push 的精簡版
 `train_kernel`（冒煙測試 + 單一實驗，拿掉主要 5-fold 訓練），每次成功跑完都會把
@@ -237,11 +260,29 @@ valid log loss 從 1.05712 飄動到 1.07493（+0.01781），且沒有發散**�
 都可能有一部分（甚至大部分）只是分類頭初始值不同造成的隨機波動，不是那個手法
 真的有害**。`train_fold()` 已經修正（`from_pretrained()` 之前先呼叫
 `set_seed()`），label smoothing 用修好的版本重新驗證過（見上面「控制實驗結果」
-段落），group_by_length 的發散結論維持，但信心度較低，還沒有用修好的版本重新
-驗證過。
+段落）。
 
-**下一步**：milestone 3 剩下訓練時 a/b 對調增強、`winner_tie` 特殊處理還沒
-開始；訓練效能這條線目前評估過的候選手法（sdpa、group_by_length、dataloader
+**修好分類頭種子後，又挖出兩個更根本的量測 bug**（詳細機制見 CLAUDE.md）：拿同樣
+設定的 fold 0 做「重跑兩次應該一樣」的決定性檢查，第二次直接被 `StopOnNonFiniteLoss`
+攔停——回頭查發現這個安全機制原本只要單一次 log 看到 `grad_norm` 非有限值就喊停，
+但那其實是 fp16 GradScaler 正常的「跳過這步、調低 scale 繼續」，不是真的訓練壞掉。
+**這代表 group_by_length 判定「發散、有害」的結論很可能本身就是誤判**，回頭看那次
+觸發停止的那一行 log，loss 是 1.079（跟前後每一步一樣正常），只有 grad_norm 是
+inf——跟這次誤觸發是同一種訊號，group_by_length 值不值得用真的不誤判的版本重新
+驗證。另外還發現 `load_best_model_at_end` 靠訓練中途一個 2000 筆小樣本子集的分數
+去挑「最佳」checkpoint，這個子集雜訊夠大，同樣設定的兩次訓練各自挑到不同進度的
+checkpoint 當最終權重，光是這個選擇上的差異就讓分數飄動超過 0.01——跟前面在測的
+手法效果量同一個量級。兩個都已修復（`StopOnNonFiniteLoss` 現在要連續 3 次
+`grad_norm` 非有限值才停，`load_best_model_at_end` 關掉、固定用訓練跑完的最終
+狀態），但**這代表這兩個 bug 修好之前做的所有單次 A/B 比較（label smoothing、
+group_by_length、下面的 a/b 對調增強）結論都要重新檢視**，還沒有用修好的版本
+重新驗證過。
+
+**下一步**：先重跑一次決定性檢查（同一次 kernel 執行內完全相同設定跑兩次），
+確認這兩個修復真的讓「同樣設定重跑」的分數不再亂飄，才能決定 label smoothing、
+group_by_length、訓練時 a/b 對調增強這幾個結論要不要重測。milestone 3 剩下
+`winner_tie` 特殊處理還沒開始；訓練效能這條線目前評估過的候選手法（sdpa、
+group_by_length、dataloader
 調整）全部放棄或無效，`torch.compile()` 因為 DeBERTa 自訂運算容易觸發頻繁
 重新編譯，評估認為優先度太低沒有試。
 
@@ -266,12 +307,17 @@ valid log loss 從 1.05712 飄動到 1.07493（+0.01781），且沒有發散**�
   - [x] label smoothing：控制好種子重測（同一次 kernel 執行內 baseline vs
         `label_smoothing=0.1`），差異只有 +0.00049（比雜訊量級 0.00288 還小）
         ——**放棄**（第一次測的「變差 0.01975」是分類頭初始值沒固定住的偽陽性）
-  - [ ] a/b 對調當「訓練時」的資料增強（目前只做了推論時的 TTA，訓練資料還沒加這個增強）
-  - [ ] 針對 `winner_tie` 這一類的處理（通常是最難、也是 loss 的主要來源）
+  - [~] a/b 對調當「訓練時」的資料增強：`ab_swap_prob` 已實作，同一次 kernel
+        執行內測出 +0.00899（看起來有幫助），但這次量測踩在兩個量測 bug（見
+        上面「量測 bug」段落）修好之前，結論待重測
+  - [ ] 針對 `winner_tie` 這一類的處理——winner_tie 診斷（見上面）發現 tie 反而
+        不是損失最集中的類別，優先度已下修
   - [x] 訓練效能：`attn_implementation="sdpa"` 不支援（HF issue #28005）、
-        `group_by_length=True` 完整 fold 實測在 epoch 0.4809 就發散（grad_norm
-        變 inf）、dataloader 調整經 profiling 確認沒有幫助——三個候選手法**全部
-        放棄**，`torch.compile()` 評估後判斷優先度太低沒有試
+        dataloader 調整經 profiling 確認沒有幫助——放棄。`group_by_length=True`
+        原本因為完整 fold 實測「發散」被放棄，後來查出那次觸發停止的 log 其實
+        loss 健康、只有 grad_norm 是 inf，很可能是安全機制誤判，不是真的訓練
+        壞掉，結論信心度低，待用修好的版本重測。`torch.compile()` 評估後判斷
+        優先度太低沒有試
 - [ ] 里程碑 4：換更大的模型 + LoRA + 4bit 量化（需要自有 GPU 或雲端 GPU）
 
 ## 參考

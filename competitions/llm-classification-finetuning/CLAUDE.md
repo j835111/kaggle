@@ -63,6 +63,37 @@ kernel 執行內控制好種子的 baseline 是 1.08190，跟正式 5-fold 訓�
 差異只有 +0.00049（比 TTA/校準量到的雜訊量級 0.00288 還小）——第一次判定的
 「變差 0.01975」是偽陽性，真實結論是「幾乎沒差，不值得重練」，不是「有害」。
 
+## `train_fold()` 曾經有兩個會讓 A/B 比較失去意義的量測 bug（已修復）
+
+修好分類頭種子問題之後（見上一段），拿同樣設定的 fold 0 做「重跑兩次應該一樣」的
+決定性檢查，結果第二次直接被安全機制攔停——追查發現還有兩個更根本的問題，兩個
+都會讓「同樣設定重跑」得到不一樣的分數，量級都跟這學期在測的手法效果量差不多，
+**在這兩個修好之前做的所有單一 kernel 執行內 A/B 比較（label smoothing、
+group_by_length、訓練時 a/b 對調增強）結論都要重新檢視，不能直接信**：
+
+1. **`StopOnNonFiniteLoss` 誤判**：舊邏輯只要單一次 log 看到 `grad_norm` 非有限值
+   就喊停。fp16 下 GradScaler 遇到某一步梯度溢位本來就會自動跳過那次更新、調低
+   scale factor 繼續，這是正常現象，loss 本身仍然健康。實測 group_by_length 那次
+   判定「發散」，回頭看觸發停止那一行 log：`loss` 是 1.079（跟前後每一步一樣
+   正常），只有 `grad_norm` 是 inf——跟這次決定性檢查裡真正無關的第二次重跑
+   （`loss` 1.095、只有 `grad_norm` inf）是同一種訊號。**group_by_length 判定
+   「有害」很可能是誤判，不是真的訓練壞掉**，這個結論現在信心度很低，值得找機會
+   重測。修法：判斷邏輯搬到 `llmcls.training_safety.should_stop_for_nonfinite()`
+   （純 Python，本機有測試），現在 `loss` 非有限值才立刻停，`grad_norm` 要連續
+   3 次非有限值才算真的卡住。
+
+2. **`load_best_model_at_end` 的 checkpoint 選擇雜訊**：`_training_args()` 原本靠
+   訓練中途對 `eval_subset_rows`（2000 筆）子集算出來的分數挑「最佳」checkpoint。
+   實測同樣設定的 fold 0 重跑兩次（label smoothing 那次的 baseline、a/b 對調增強
+   那次的 baseline），各自挑中不同進度的 checkpoint 當最終權重（分別是 epoch
+   1.574 跟 epoch 1.049）——光是這層選擇上的雜訊，就讓兩次「應該一樣」的最終分數
+   飄動超過 0.01，跟要測的手法效果量同一個量級。修法：`load_best_model_at_end`
+   改成 `False`，固定用訓練跑完當下的最終狀態，不再靠子集分數挑歷史版本。
+
+**這兩個修好之後還沒重新驗證過**：下一步要做的是重跑一次決定性檢查（同一次 kernel
+執行內完全相同設定跑兩次），確認新程式碼下這個飄動有沒有真的消失或至少小很多，
+才能決定 label smoothing／a、b 對調增強的結論還要不要重測。
+
 ## Kaggle CLI（2.2.4）沒有「停止正在跑的 kernel」這個指令
 
 `kaggle kernels --help` 列出來的只有
