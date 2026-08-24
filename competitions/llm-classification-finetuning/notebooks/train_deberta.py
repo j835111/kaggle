@@ -87,6 +87,54 @@ assert not smoke["diverged"] and smoke["n_nonfinite"] == 0, (
 print("煙霧測試通過，加速設定沒有引入不穩定")
 
 # %% [markdown]
+# ## 決定性檢查（診斷用）：同樣設定重跑兩次，分數應該要一樣
+#
+# a/b 對調增強實驗測出「baseline 1.09416 vs `ab_swap_prob=0.5` 1.08516，差異
+# +0.00899」，但這次的 baseline（1.09416）跟上一次 label smoothing 實驗測出的
+# baseline（完全一樣的設定：fold 0、沒開任何新手法、種子已固定）卻是
+# **1.08190**——兩個「應該要一樣」的數字，隔了兩次不同的 kernel 執行，差了
+# **0.01226**，跟 a/b 對調增強量到的效果量同一個等級、甚至更大。分類頭初始值
+# 已經被 `set_seed()` 固定住了，這代表還有另一個沒被固定住的隨機來源（最可能
+# 是 GPU 某些運算本身不是完全確定性的——DeBERTa 相對位置編碼的反向傳播會用到
+# `scatter_add_` 這類原子操作，GPU 上多執行緒的加總順序不保證每次一樣，浮點
+# 誤差在幾千步訓練裡累積放大，並不需要 CUDA 本身真的「隨機」，只要加總順序
+# 不同、浮點捨入誤差就會不同）。
+#
+# 這裡直接測「這個隨機來源到底有多大」：**同一次 kernel 執行內，完全相同的
+# 設定呼叫 `train_fold()` 兩次**——如果兩次分數幾乎一樣，代表同一次執行內的
+# A/B 比較是可信的（label smoothing、a/b 對調增強量到的效果量都能信）；如果
+# 兩次分數也飄動到 0.01 這個量級，代表現在的 A/B 比較方法本身不夠嚴謹，兩個
+# 手法的結論都要重新檢視，可能需要 `torch.use_deterministic_algorithms(True)`
+# 之類的手段先把這個隨機來源也固定住。這次刻意跟前兩次實驗分開、單獨一次
+# kernel 執行只做這個檢查，避免又混進其他呼叫順序的差異當額外變因。
+
+# %%
+determinism_run1 = train_fold(
+    fold=0, epochs=2, batch_size=8, max_len=512, lr=2e-5,
+    fp16=True, eval_steps=1500, eval_subset_rows=2000,
+    output_dir="/kaggle/working/model/_determinism_check_1",
+)
+print(f"第一次 valid log loss: {determinism_run1['score']:.5f}")
+assert not determinism_run1["diverged"] and determinism_run1["n_nonfinite"] == 0, (
+    "第一次訓練發散或有非有限值，不要拿這個結果做決定"
+)
+
+determinism_run2 = train_fold(
+    fold=0, epochs=2, batch_size=8, max_len=512, lr=2e-5,
+    fp16=True, eval_steps=1500, eval_subset_rows=2000,
+    output_dir="/kaggle/working/model/_determinism_check_2",
+)
+print(f"第二次 valid log loss: {determinism_run2['score']:.5f}")
+assert not determinism_run2["diverged"] and determinism_run2["n_nonfinite"] == 0, (
+    "第二次訓練發散或有非有限值，不要拿這個結果做決定"
+)
+
+print(
+    f"差異：{determinism_run1['score'] - determinism_run2['score']:+.5f}"
+    "（應該接近 0，代表同一次執行內的重跑是決定性的）"
+)
+
+# %% [markdown]
 # ## Label smoothing 實驗（milestone 3，已測完，結論：放棄）
 #
 # 第一次在 fold 0 實測 `label_smoothing=0.1`，valid log loss 1.08815，比基準
