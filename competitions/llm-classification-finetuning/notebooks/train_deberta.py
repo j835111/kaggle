@@ -87,69 +87,84 @@ assert not smoke["diverged"] and smoke["n_nonfinite"] == 0, (
 print("煙霧測試通過，加速設定沒有引入不穩定")
 
 # %% [markdown]
-# ## 決定性檢查（診斷用）：同樣設定重跑兩次，分數應該要一樣
+# ## 決定性檢查（診斷用，已測完，結論：修復有效）
 #
-# a/b 對調增強實驗測出「baseline 1.09416 vs `ab_swap_prob=0.5` 1.08516，差異
-# +0.00899」，但這次的 baseline（1.09416）跟上一次 label smoothing 實驗測出的
-# baseline（完全一樣的設定：fold 0、沒開任何新手法、種子已固定）卻是
-# **1.08190**——兩個「應該要一樣」的數字，隔了兩次不同的 kernel 執行，差了
-# **0.01226**，跟 a/b 對調增強量到的效果量同一個等級、甚至更大。分類頭初始值
-# 已經被 `set_seed()` 固定住了，這代表還有另一個沒被固定住的隨機來源（最可能
-# 是 GPU 某些運算本身不是完全確定性的——DeBERTa 相對位置編碼的反向傳播會用到
-# `scatter_add_` 這類原子操作，GPU 上多執行緒的加總順序不保證每次一樣，浮點
-# 誤差在幾千步訓練裡累積放大，並不需要 CUDA 本身真的「隨機」，只要加總順序
-# 不同、浮點捨入誤差就會不同）。
+# a/b 對調增強實驗測出的效果量（+0.00899）跟兩次不同 kernel 執行的 baseline
+# 落差（0.01226）同一個量級，追查發現 `train_fold()` 有兩個會讓「同樣設定重跑」
+# 得到不同分數的量測 bug（詳細機制見 CLAUDE.md「兩個會讓 A/B 比較失去意義的量測
+# bug」段落）：
 #
-# 這裡直接測「這個隨機來源到底有多大」：**同一次 kernel 執行內，完全相同的
-# 設定呼叫 `train_fold()` 兩次**——如果兩次分數幾乎一樣，代表同一次執行內的
-# A/B 比較是可信的（label smoothing、a/b 對調增強量到的效果量都能信）；如果
-# 兩次分數也飄動到 0.01 這個量級，代表現在的 A/B 比較方法本身不夠嚴謹，兩個
-# 手法的結論都要重新檢視，可能需要 `torch.use_deterministic_algorithms(True)`
-# 之類的手段先把這個隨機來源也固定住。這次刻意跟前兩次實驗分開、單獨一次
-# kernel 執行只做這個檢查，避免又混進其他呼叫順序的差異當額外變因。
+# 1. `StopOnNonFiniteLoss` 誤判——單一次 log 看到 `grad_norm` 非有限值就喊停，
+#    但那其實是 fp16 GradScaler 正常的「跳過這步、調低 scale 繼續」，不是真的
+#    訓練壞掉（group_by_length 那次「發散」就是這樣被誤判的）。
+# 2. `load_best_model_at_end` 靠訓練中途一個 2000 筆小樣本子集的分數去挑「最佳」
+#    checkpoint，這個子集雜訊夠大，同樣設定的兩次訓練各自挑到不同進度的
+#    checkpoint 當最終權重。
+#
+# 兩個都修好之後（`grad_norm` 要連續 3 次非有限值才停；`load_best_model_at_end`
+# 關掉，固定用訓練跑完的最終狀態），同一次 kernel 執行內重跑兩次完全相同設定：
+# **1.08448 vs 1.08683，差異只有 -0.00235**——比雜訊量級（標準差 0.00288）還小，
+# 回到合理範圍。**同一次 kernel 執行內的 A/B 比較重新可信**，下面用這個修好的
+# 版本重測 label smoothing 跟 group_by_length。
+
+# %% [markdown]
+# ## 重測 label smoothing + group_by_length（用修好的量測方法，共用一個 baseline）
+#
+# 這兩個手法之前的「放棄」結論都是在上面兩個量測 bug 修好之前測的，信心度低：
+# label smoothing 第一次判定「變差 0.01975」，後來發現分類頭初始值沒固定住，
+# 重測後差異只剩 +0.00049（雜訊量級）；group_by_length 判定「發散」，後來查出
+# 觸發停止那一行 log 其實 loss 健康（1.079）、只有 grad_norm 是 inf，跟
+# `StopOnNonFiniteLoss` 誤判的訊號一模一樣，很可能從來沒有真的發散過。
+#
+# 這次同一個 kernel 執行內共用**一個** baseline，分別跟 `label_smoothing=0.1`、
+# `group_by_length=True` 比——兩個手法互不相關，用同一個 baseline 比對是合理的，
+# 不需要各自重跑一次 baseline，省下一次 fold 0 訓練的時間。`group_by_length`
+# 的記憶體風險（把長句子集中到同一個 batch）之前只測過單步 forward+backward
+# 沒有 OOM，這次是完整 2 epochs 訓練，`diverged`/`n_nonfinite` 檢查不放寬。
 
 # %%
-determinism_run1 = train_fold(
+retest_baseline = train_fold(
     fold=0, epochs=2, batch_size=8, max_len=512, lr=2e-5,
     fp16=True, eval_steps=1500, eval_subset_rows=2000,
-    output_dir="/kaggle/working/model/_determinism_check_1",
+    output_dir="/kaggle/working/model/_retest_baseline_fold0",
 )
-print(f"第一次 valid log loss: {determinism_run1['score']:.5f}")
-assert not determinism_run1["diverged"] and determinism_run1["n_nonfinite"] == 0, (
-    "第一次訓練發散或有非有限值，不要拿這個結果做決定"
+print(f"baseline valid log loss: {retest_baseline['score']:.5f}")
+assert not retest_baseline["diverged"] and retest_baseline["n_nonfinite"] == 0, (
+    "baseline 訓練發散或有非有限值，不要拿這個結果做決定"
 )
 
-determinism_run2 = train_fold(
+retest_label_smoothing = train_fold(
     fold=0, epochs=2, batch_size=8, max_len=512, lr=2e-5,
     fp16=True, eval_steps=1500, eval_subset_rows=2000,
-    output_dir="/kaggle/working/model/_determinism_check_2",
+    label_smoothing=0.1,
+    output_dir="/kaggle/working/model/_retest_label_smoothing_fold0",
 )
-print(f"第二次 valid log loss: {determinism_run2['score']:.5f}")
-assert not determinism_run2["diverged"] and determinism_run2["n_nonfinite"] == 0, (
-    "第二次訓練發散或有非有限值，不要拿這個結果做決定"
+print(f"label_smoothing=0.1 valid log loss: {retest_label_smoothing['score']:.5f}")
+assert not retest_label_smoothing["diverged"] and retest_label_smoothing["n_nonfinite"] == 0, (
+    "label smoothing 訓練發散或有非有限值，不要拿這個結果做決定"
 )
-
 print(
-    f"差異：{determinism_run1['score'] - determinism_run2['score']:+.5f}"
-    "（應該接近 0，代表同一次執行內的重跑是決定性的）"
+    f"label smoothing 差異：{retest_baseline['score'] - retest_label_smoothing['score']:+.5f}"
+    "（正值代表 label smoothing 有幫助）"
+)
+
+retest_group_by_length = train_fold(
+    fold=0, epochs=2, batch_size=8, max_len=512, lr=2e-5,
+    fp16=True, eval_steps=1500, eval_subset_rows=2000,
+    group_by_length=True,
+    output_dir="/kaggle/working/model/_retest_group_by_length_fold0",
+)
+print(f"group_by_length=True valid log loss: {retest_group_by_length['score']:.5f}")
+assert not retest_group_by_length["diverged"] and retest_group_by_length["n_nonfinite"] == 0, (
+    "group_by_length 訓練發散或有非有限值——這次是修好誤判邏輯之後還發散，這次是真的，不要拿這個結果做決定"
+)
+print(
+    f"group_by_length 差異：{retest_baseline['score'] - retest_group_by_length['score']:+.5f}"
+    "（正值代表 group_by_length 有幫助）"
 )
 
 # %% [markdown]
-# ## Label smoothing 實驗（milestone 3，已測完，結論：放棄）
-#
-# 第一次在 fold 0 實測 `label_smoothing=0.1`，valid log loss 1.08815，比基準
-# 1.06840 變差 0.01975，判定「有害」——但那次的基準跟實驗是不同時間跑的兩次
-# 訓練，後來發現分類頭初始值沒被 `TrainingArguments(seed=42)` 固定住
-# （`from_pretrained()` 隨機初始化新的分類頭是在 `Trainer` 建立、seed 生效**之前**
-# 執行的），差距有可能大半是隨機運氣，不是 label smoothing 真的有害。`train_fold()`
-# 已修正（`from_pretrained()` 之前先呼叫 `set_seed(SEED)`），用修好的版本重新做了
-# 一次同一個 kernel 執行內的控制 A/B（baseline 跟 `label_smoothing=0.1` 分類頭
-# 起始值保證一致）：baseline **1.08190**、`label_smoothing=0.1` **1.08140**，
-# 差異只有 **+0.00049**——比 TTA/校準量到的雜訊量級（標準差 0.00288）還小，代表
-# 這個差距本身就是雜訊。**結論：放棄**——不是因為它有害，是因為效果在雜訊範圍內，
-# 不值得為了看不出來的差距重練全部 5 個 fold。詳細數字見 README.md「目前狀態」
-# 段落。`train_fold()` 的 `label_smoothing` 參數留著（預設 0.0，不影響現有行為），
-# 測試用的 cell 已經拿掉，不會再浪費 GPU 時間重跑。
+# 詳細數字見 README.md「目前狀態」段落。
 
 # %% [markdown]
 # ## 訓練時 a/b 對調增強實驗（milestone 3，這次要測的）
@@ -222,35 +237,6 @@ print(f"差異：{ab_swap_baseline['score'] - ab_swap_variant['score']:+.5f}（�
 # %% [markdown]
 # 詳細數字見 README.md「目前狀態」段落。milestone 3 剩下的候選手法：`winner_tie`
 # 特殊處理——今天的診斷顯示 tie 反而不是損失最集中的類別，優先度已下修。
-
-# %% [markdown]
-# ## `group_by_length` 實驗（訓練效能，已測完，結論：放棄）
-#
-# 在 fold 0 單獨測過（output_dir 跟主要 5-fold 訓練分開，不影響正式權重）：訓練在
-# epoch 0.4809（原訂 2 epochs，只跑了 24%）就被 `StopOnNonFiniteLoss` 攔截停止——
-# `grad_norm` 在那一步變成 `inf`，跟這個模型已知在 fp32/peak LR 附近容易發散是
-# 同一類問題（見里程碑 2 的踩坑紀錄）。合理推測：`group_by_length` 把長度相近的
-# 樣本集中到同一個 batch，可能讓某些 batch 全部是長句子、梯度震幅比原本長短混合的
-# batch 更劇烈，在這個已知敏感的模型上更容易踩到 fp16 數值溢位。
-#
-# **這裡踩到訓練實驗的一個通用陷阱要記錄**：訓練被安全機制提前攔停之後，記錄下來的
-# 「耗時 1256s（比基準 6051s 快 79%）」跟「valid log loss 1.09921（比基準 1.06840
-# 差 0.03081）」**兩個數字都不是有效比較**——不是 group_by_length 讓訓練變快，是
-# 訓練只跑了四分之一就被緊急煞車攔下來；分數變差也是因為模型根本沒練完，不是
-# group_by_length 本身讓分數變爛。判斷一個訓練實驗有沒有意義，第一步永遠是先確認
-# `diverged=False`，時間和分數的比較才有意義。
-#
-# **註記**：這次測試是在發現分類頭初始化沒被 seed 固定（見上面 label smoothing
-# 那段）之前做的，理論上不同的隨機初始值也可能影響訓練在哪個點對梯度爆炸比較敏感。
-# 但這裡是**直接發散**（grad_norm 變 inf），不是「分數飄動 0.01~0.02」這種量級的
-# 問題，用不同初始值再測一次也未必會每次都發散，但發散本身仍然是一個真實訊號，不是
-# 憑空捏造的——只是還沒有用修好 seeding 的版本重新驗證過，結論維持放棄，但信心
-# 沒有 label smoothing 那次（已經重測過）那麼高。
-#
-# 結論：**不要用**，`train_fold()` 的 `group_by_length` 參數留著（預設 False，
-# 行為不變）。要讓它可用可能需要額外調低 peak LR 或拉長 warmup，但這是額外的調參
-# 投入，跟 label smoothing 一樣先不追加投入，把力氣留給 milestone 3 剩下的候選
-# 手法。詳細數字見 README.md「目前狀態」段落。
 
 # %% [markdown]
 # 煙霧測試過關後才跑完整訓練。valid log loss 必須小於 1.09861（ln 3）—— 這是本專案
