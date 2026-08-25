@@ -284,11 +284,36 @@ group_by_length、下面的 a/b 對調增強）結論都要重新檢視**，還�
 範圍內，不再是修好之前 0.01~0.035 那種大幅飄動。現在同一次 kernel 執行內的
 A/B 比較可以信了。
 
-**下一步**：milestone 3 剩下 `winner_tie` 特殊處理還沒開始；label smoothing、
-group_by_length、訓練時 a/b 對調增強這三個結論可以考慮用現在可信的版本重測；
-訓練效能這條線目前評估過的候選手法（sdpa、dataloader 調整）全部放棄或無效，
-`torch.compile()` 因為 DeBERTa 自訂運算容易觸發頻繁重新編譯，評估認為優先度
-太低沒有試。
+**label smoothing + group_by_length 用可信的版本重測，結論翻盤**：同一次 kernel
+執行內共用一個 baseline（1.08375），分別測 `label_smoothing=0.1` 跟
+`group_by_length=True`，這次三個訓練全部乾淨跑完，連一次孤立的 grad_norm 異常
+都沒出現。
+
+- **label smoothing：1.05034，差異 +0.03341**——是雜訊量級（標準差 0.00288）的
+  10 幾倍，不可能是雜訊，判定「真的有效」。跟第一次判定「有害」（-0.01975）、
+  第二次判定「沒差」（+0.00049）都不一樣，最可能的原因是 checkpoint 選擇雜訊：
+  label smoothing 改的是損失函數本身，它的好處（不讓模型對預測太自信）可能要
+  練到接近訓練結束才完全展現，舊的 `load_best_model_at_end` 邏輯可能挑到效果
+  還沒發揮完全的中途版本去比較。**結論：正式採用**——`train_deberta.py` 主要
+  5-fold 訓練迴圈已經加上 `label_smoothing=0.1`，`train_kernel/kernel-metadata.json`
+  的 `dataset_sources` 已清空（舊的 `fold0-4-checkpoints` 是沒有 label smoothing
+  的權重，訓練配方換了必須整批重練，不能沿用）。
+- **group_by_length：1.09795，差異 -0.01421**——這次沒有發散（證實原本「發散」
+  是 `StopOnNonFiniteLoss` 誤判），但拿掉誤判之後，它本身還是讓分數變差了，是
+  雜訊量級的 5 倍左右，不是雜訊。**結論維持放棄**，但理由不一樣了：不是「危險、
+  訓練會壞掉」，是「訓練穩定但品質打折扣」——省下的 padding 運算成本换來的是
+  略差的收斂品質。
+
+**下一步（等 GPU 額度足夠時執行）**：5-fold 全部用 `label_smoothing=0.1` 重練
+（單一 fold 實測約 1.78 小時，5 個 fold ≈ 8.9 小時，一次性額度可能不夠，注意
+不要中途被切斷——參考上面「修復 fold 4 遺失」的教訓）。練完後比照上次的做法把
+輸出打包成新 Dataset，取代 `fold0-4-checkpoints`，`train_kernel`/`infer_kernel`/
+`calibrate_kernel` 的 `dataset_sources` 都要跟著改，再重新驗證 TTA/校準在 5 個
+fold 上是否依然一致改善，最後送出新的排行榜分數。milestone 3 剩下 `winner_tie`
+特殊處理、訓練時 a/b 對調增強（結果待重測，前一次 +0.00899 是在兩個量測 bug
+修好之前測的）還沒開始；訓練效能這條線目前評估過的候選手法（sdpa、dataloader
+調整）全部放棄或無效，`torch.compile()` 因為 DeBERTa 自訂運算容易觸發頻繁
+重新編譯，評估認為優先度太低沒有試。
 
 ## 路線圖
 
@@ -308,20 +333,23 @@ group_by_length、訓練時 a/b 對調增強這三個結論可以考慮用現在
         已送出排行榜：public score 1.05159（milestone 2 為 1.07748）
   - [x] 5-fold 機率平均 ensemble：`infer_deberta.py` push 上 Kaggle 送排行榜，
         public score 1.04529（單 fold + TTA + 校準是 1.05159）
-  - [x] label smoothing：控制好種子重測（同一次 kernel 執行內 baseline vs
-        `label_smoothing=0.1`），差異只有 +0.00049（比雜訊量級 0.00288 還小）
-        ——**放棄**（第一次測的「變差 0.01975」是分類頭初始值沒固定住的偽陽性）
+  - [~] label smoothing：兩個量測 bug（`StopOnNonFiniteLoss` 誤判、
+        `load_best_model_at_end` checkpoint 選擇雜訊）修好後用可信版本重測，
+        `label_smoothing=0.1` 差異 **+0.03341**（雜訊量級 10 幾倍，不是雜訊）
+        ——**正式採用**，`train_deberta.py` 主要訓練迴圈已加上這個參數，等 GPU
+        額度足夠時執行 5-fold 全部重練（單一 fold ≈ 1.78 小時，5 個 fold ≈ 8.9
+        小時）
   - [~] a/b 對調當「訓練時」的資料增強：`ab_swap_prob` 已實作，同一次 kernel
-        執行內測出 +0.00899（看起來有幫助），但這次量測踩在兩個量測 bug（見
-        上面「量測 bug」段落）修好之前，結論待重測
+        執行內測出 +0.00899（看起來有幫助），但這次量測踩在兩個量測 bug 修好
+        之前，結論待重測
   - [ ] 針對 `winner_tie` 這一類的處理——winner_tie 診斷（見上面）發現 tie 反而
         不是損失最集中的類別，優先度已下修
   - [x] 訓練效能：`attn_implementation="sdpa"` 不支援（HF issue #28005）、
         dataloader 調整經 profiling 確認沒有幫助——放棄。`group_by_length=True`
-        原本因為完整 fold 實測「發散」被放棄，後來查出那次觸發停止的 log 其實
-        loss 健康、只有 grad_norm 是 inf，很可能是安全機制誤判，不是真的訓練
-        壞掉，結論信心度低，待用修好的版本重測。`torch.compile()` 評估後判斷
-        優先度太低沒有試
+        用可信版本重測，差異 -0.01421（雜訊量級 5 倍左右），這次沒有發散，證實
+        原本判定「發散」是安全機制誤判，但拿掉誤判後它本身還是讓分數變差——
+        **結論維持放棄**，理由從「危險」改成「品質打折扣」。`torch.compile()`
+        評估後判斷優先度太低沒有試
 - [ ] 里程碑 4：換更大的模型 + LoRA + 4bit 量化（需要自有 GPU 或雲端 GPU）
 
 ## 參考

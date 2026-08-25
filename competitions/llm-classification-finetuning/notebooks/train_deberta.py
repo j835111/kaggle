@@ -260,6 +260,16 @@ print(f"差異：{ab_swap_baseline['score'] - ab_swap_variant['score']:+.5f}（�
 # 那次事故裡 fold 0-3 其實都順利練完、分數都贏過基準（1.06840 / 1.05461 / 1.07391 /
 # 1.08028），只有 fold 4 沒存到——下面會先檢查 `/kaggle/input` 有沒有掛之前留下來的
 # 權重，有的話直接複製過來、略過重新訓練，不用 5 個全部重練一次。
+#
+# **這次要正式套用 `label_smoothing=0.1`**（見上面的重測結果，同一次 kernel 執行
+# 內控制實驗量到 +0.03341，遠大於雜訊量級，值得整批重練——見 CLAUDE.md「Label
+# smoothing / 訓練時資料增強這類手法，改了就得整批重練」）。`fold0-4-checkpoints`
+# 這個 Dataset 裡的 5 個 fold 都是**沒有** label smoothing 練出來的舊權重，訓練
+# 配方換了，不能沿用、必須全部重練——`train_kernel/kernel-metadata.json` 的
+# `dataset_sources` 已經清空，下面的複製-跳過邏輯不會找到任何東西可跳過，5 個
+# fold 都會真的重新訓練。訓練完成後務必比照上次的做法，把輸出打包成新的 Dataset
+# 取代 `fold0-4-checkpoints`，`train_kernel`/`infer_kernel`/`calibrate_kernel`
+# 的 `dataset_sources` 都要跟著改指到新 Dataset。
 
 # %%
 import pathlib
@@ -295,6 +305,7 @@ for fold in range(N_FOLDS):
     result = train_fold(
         fold=fold, epochs=2, batch_size=8, max_len=512, lr=2e-5,
         fp16=True, eval_steps=1500, eval_subset_rows=2000,
+        label_smoothing=0.1,
     )
     print(f"fold {fold} 訓練總耗時：{time.time() - _t0:.0f}s")
     assert not result["diverged"] and result["n_nonfinite"] == 0, (
